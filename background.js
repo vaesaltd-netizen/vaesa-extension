@@ -1,0 +1,1422 @@
+// VAESA Extension v3.0.0 — service worker.
+//
+// Port verbatim từ Retion 0.2.3.1 (EXT-0.2.3.1).
+// Source: chrome-extension/src/background/background/facebook/{user,client,page}.ts
+//
+// Flow gửi tin >24h:
+//   1. Webapp postMessage SEND_FB → content.js → background
+//   2. Background.calcGlobalUid(pageId, threadId, lastMessageMs)
+//      ├─ Check IndexedDB cache (90 ngày)
+//      ├─ Cache miss → POST FB GraphQL graphqlbatch
+//      │  doc_id 5947328892029037, limit:1, before: lastMessageMs+1000
+//      ├─ Match thread.page_comm_item.comm_source_id === threadId
+//      └─ Extract messaging_actor.id = global UID
+//   3. Background.sendText / sendFile via business.facebook.com/messaging/send
+//   4. Trả response về webapp
+
+// ============== CONSTANTS ==============
+
+const FB_ME_URL = 'https://www.facebook.com/me'
+const FB_GRAPHQL_URL = 'https://www.facebook.com/api/graphqlbatch'
+const FB_SEND_URL = 'https://business.facebook.com/messaging/send'
+const FB_UPLOAD_URL = 'https://upload-business.facebook.com/ajax/mercury/upload.php'
+const DOC_ID_MESSAGE = '5947328892029037'
+
+// VAESA backend (Cloudflare Pages Functions + D1) — port kiến trúc Retion `chatbox-merge-v2.botbanhang.vn`
+// nhưng đặt cùng domain với webapp để KH tự host (không phụ thuộc bên thứ 3).
+const VAESA_BE_BASE = 'https://vaesa-livechat.pages.dev/api/fb-uid'
+
+const DTSG_TTL_MS = 30 * 60 * 1000          // 30 phút (Retion dùng 30s, em nâng lên 30 phút cho VAESA real-time)
+const UID_CACHE_TTL_MS = 90 * 24 * 60 * 60 * 1000  // 90 ngày (giống Retion)
+
+const FB_ORIGINS_TO_REWRITE = [
+  'https://m.facebook.com',
+  'https://p-upload.facebook.com',
+  'https://business.facebook.com',
+  'https://upload.facebook.com',
+  'https://www.facebook.com',
+  'https://mbasic.facebook.com',
+  'https://upload-business.facebook.com',
+]
+
+console.log('[VAESA Extension v3] service worker started')
+
+// ============== DNR: rewrite Origin/Referer for FB requests ==============
+// Port từ Retion origin.ts. Khi BG fetch FB → tự rewrite Origin/Referer = host của URL → bypass CORS.
+function _installDnrRules() {
+  let ruleId = 1
+  const rules = FB_ORIGINS_TO_REWRITE.map((url) => ({
+    id: ruleId++,
+    action: {
+      type: 'modifyHeaders',
+      requestHeaders: [
+        { header: 'Referer', operation: 'set', value: `${url}/` },
+        { header: 'Origin', operation: 'set', value: url },
+      ],
+    },
+    condition: {
+      initiatorDomains: [chrome.runtime.id],
+      urlFilter: `|${url}/`,
+      resourceTypes: ['xmlhttprequest', 'websocket'],
+    },
+  }))
+  // MQTT WebSocket tới edge-chat.facebook.com: FB từ chối handshake nếu Origin không
+  // phải facebook.com (service worker mặc định gửi Origin: chrome-extension://...).
+  // Port nguyên rule id 10 của Pancake v2: Origin = business.facebook.com, KHÔNG
+  // dùng initiatorDomains (request WS từ SW không match initiatorDomains), urlFilter
+  // literal `wss://...` (DNR match substring trên URL ws thật).
+  rules.push({
+    id: ruleId++,
+    priority: 1,
+    action: {
+      type: 'modifyHeaders',
+      requestHeaders: [
+        { header: 'Origin', operation: 'set', value: 'https://business.facebook.com' },
+      ],
+    },
+    condition: {
+      urlFilter: 'wss://edge-chat.facebook.com',
+      resourceTypes: ['websocket'],
+    },
+  })
+  chrome.declarativeNetRequest.getDynamicRules().then((existing) => {
+    chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: existing.map(r => r.id),
+      addRules: rules,
+    }).then(() => console.log('[VAESA Bridge] DNR rules installed:', rules.length))
+      .catch((e) => console.error('[VAESA Bridge] DNR install fail:', e?.message || e))
+  })
+}
+chrome.runtime.onInstalled.addListener(_installDnrRules)
+// onInstalled không fire khi service worker chỉ wake lại — gọi luôn để chắc chắn có rule.
+_installDnrRules()
+
+// ============== FACEBOOK USER: scrape fb_dtsg/lsd/c_user ==============
+// Port từ Retion user.ts
+
+const _fbUser = {
+  dtsg: null,
+  lsd: null,
+  currentUID: null,
+  ttl: 0,
+}
+
+async function loadDtsg() {
+  const html = await fetch(FB_ME_URL, {
+    credentials: 'include',
+    headers: {
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'accept-language': 'en-US,en;q=0.9',
+    },
+  }).then(r => r.text())
+
+  // 3 regex thử tuần tự (port verbatim Retion)
+  const dtsg =
+    html.match(/name="fb_dtsg" value="([^"]+)"/i)?.[1] ||
+    html.match(/\["DTSGInitialData"\,\[\]\,\{"token"\:"([^"]+)"/i)?.[1] ||
+    html.match(/{"dtsg":{"token":"([^"]+)"/i)?.[1]
+
+  const lsd =
+    html.match(/name="lsd" value="([^"]+)"/i)?.[1] ||
+    html.match(/\["LSD"\,\[\]\,\{"token"\:"([^"]+)"/i)?.[1]
+
+  const uid = html.match(/"ACCOUNT_ID"\s*:\s*"(\d+)"/)?.[1]
+
+  if (!dtsg) throw new Error('Không scrape được fb_dtsg — Anh chưa đăng nhập FB?')
+
+  _fbUser.dtsg = dtsg
+  _fbUser.lsd = lsd
+  _fbUser.currentUID = uid
+  _fbUser.ttl = Date.now() + DTSG_TTL_MS
+
+  console.log('[VAESA Bridge] dtsg loaded, uid:', uid)
+}
+
+async function getDtsg() {
+  if (_fbUser.ttl > Date.now() && _fbUser.dtsg) return _fbUser.dtsg
+  await loadDtsg()
+  return _fbUser.dtsg
+}
+
+async function getCurrentUid() {
+  if (_fbUser.ttl > Date.now() && _fbUser.currentUID) return _fbUser.currentUID
+  await loadDtsg()
+  return _fbUser.currentUID
+}
+
+// ============== UID CACHE (IndexedDB) ==============
+// Port từ Retion indexedDbHelper.js (chrome-extension/src/content/indexedDbHelper.js).
+// Adapted cho SW context: dùng `self.indexedDB`. Store `global_user_ids`,
+// keyPath: [pageId, threadId], TTL 90 ngày.
+// Fallback chrome.storage.local nếu IDB unavailable (vd test env).
+
+const IDB_DB_NAME = 'vaesa_fb_meta'
+const IDB_DB_VERSION = 1
+const IDB_STORE = 'global_user_ids'
+let _idbPromise = null
+
+function openIdb() {
+  if (_idbPromise) return _idbPromise
+  _idbPromise = new Promise((resolve, reject) => {
+    try {
+      if (typeof self === 'undefined' || !self.indexedDB) return reject(new Error('IndexedDB unavailable'))
+      const req = self.indexedDB.open(IDB_DB_NAME, IDB_DB_VERSION)
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result
+        if (!db.objectStoreNames.contains(IDB_STORE)) {
+          const store = db.createObjectStore(IDB_STORE, { keyPath: ['pageId', 'threadId'] })
+          store.createIndex('insertedAt_index', 'insertedAt', { unique: false })
+        }
+      }
+      req.onsuccess = () => resolve(req.result)
+      req.onerror = () => reject(req.error || new Error('IDB open fail'))
+    } catch (e) {
+      reject(e)
+    }
+  }).catch((e) => {
+    console.warn('[VAESA Bridge] IDB unavailable, fallback chrome.storage:', e?.message || e)
+    return null
+  })
+  return _idbPromise
+}
+
+async function idbGet(pageId, threadId) {
+  try {
+    const db = await openIdb()
+    if (!db) return null
+    return await new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, 'readonly')
+      const req = tx.objectStore(IDB_STORE).get([String(pageId), String(threadId)])
+      req.onsuccess = () => resolve(req.result || null)
+      req.onerror = () => resolve(null)
+    })
+  } catch { return null }
+}
+
+async function idbPut(pageId, threadId, globalUid) {
+  try {
+    const db = await openIdb()
+    if (!db) return
+    await new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite')
+      const req = tx.objectStore(IDB_STORE).put({
+        pageId: String(pageId),
+        threadId: String(threadId),
+        globalUid,
+        insertedAt: Math.floor(Date.now() / 1000),
+      })
+      req.onsuccess = () => resolve()
+      req.onerror = () => resolve()
+    })
+  } catch (e) {
+    console.warn('[VAESA Bridge] idbPut fail:', e?.message)
+  }
+}
+
+async function idbClear() {
+  try {
+    const db = await openIdb()
+    if (!db) return 0
+    return await new Promise((resolve) => {
+      let count = 0
+      const tx = db.transaction(IDB_STORE, 'readwrite')
+      const store = tx.objectStore(IDB_STORE)
+      const cur = store.openCursor()
+      cur.onsuccess = () => {
+        const c = cur.result
+        if (c) { count++; c.delete(); c.continue() }
+        else resolve(count)
+      }
+      cur.onerror = () => resolve(count)
+    })
+  } catch { return 0 }
+}
+
+// Purge entries older than 90 ngày (chạy mỗi lần SW boot)
+async function idbPurgeExpired() {
+  try {
+    const db = await openIdb()
+    if (!db) return
+    const cutoff = Math.floor(Date.now() / 1000) - 90 * 24 * 60 * 60
+    await new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite')
+      const idx = tx.objectStore(IDB_STORE).index('insertedAt_index')
+      const cur = idx.openCursor(IDBKeyRange.upperBound(cutoff))
+      cur.onsuccess = () => {
+        const c = cur.result
+        if (c) { c.delete(); c.continue() } else resolve()
+      }
+      cur.onerror = () => resolve()
+    })
+  } catch (e) {}
+}
+
+// Schedule purge on SW boot (non-blocking)
+idbPurgeExpired()
+
+async function getCachedUid(pageId, threadId) {
+  const row = await idbGet(pageId, threadId)
+  if (!row?.globalUid) return null
+  const ageMs = Date.now() - (row.insertedAt || 0) * 1000
+  if (ageMs > UID_CACHE_TTL_MS) return null
+  return row.globalUid
+}
+
+async function setCachedUid(pageId, threadId, globalUid) {
+  await idbPut(pageId, threadId, globalUid)
+}
+
+// ============== CALC GLOBAL UID ==============
+// Port từ Retion FacebookClient.#exchangeClientUid()
+// 1 GraphQL call: limit:1, before:lastMessageMs+1000 → match comm_source_id === threadId → messaging_actor.id
+
+// Gọi 1 batch FB GraphQL với cursor `before` (ms). Trả về { threads, oldestTime }
+async function fetchThreadBatch(pageId, beforeMs, limit) {
+  const dtsg = await getDtsg()
+  const params = new URLSearchParams({
+    batch_name: 'MessengerGraphQLThreadlistFetcher',
+    av: pageId,
+    fb_dtsg: dtsg,
+    queries: JSON.stringify({
+      o0: {
+        doc_id: DOC_ID_MESSAGE,
+        query_params: { limit, before: beforeMs },
+      },
+    }),
+  })
+  const res = await fetch(FB_GRAPHQL_URL, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params,
+  })
+  if (!res.ok) throw new Error('FB GraphQL HTTP ' + res.status)
+  let text = await res.text()
+  if (text.includes('errorSummary')) {
+    if (text.includes('Query Rate Limit Exceeded')) throw new Error('FB rate limit')
+    if (text.includes('Sorry, something went wrong')) throw new Error('FB something went wrong')
+    throw new Error('FB error: ' + text.slice(0, 200))
+  }
+  text = text
+    .replace('{"successful_results":1,"error_results":0,"skipped_results":0}', '')
+    .replace('{"successful_results":0,"error_results":1,"skipped_results":0}', '')
+  const json = JSON.parse(text)
+  const threads = json?.o0?.data?.viewer?.message_threads?.nodes || []
+  const oldestTime = threads.length
+    ? parseInt(threads[threads.length - 1].updated_time_precise) || 0
+    : 0
+  return { threads, oldestTime }
+}
+
+function extractUidFromThread(t) {
+  return t?.all_participants?.nodes?.[0]?.messaging_actor?.id ||
+         t?.all_participants?.edges?.[0]?.node?.messaging_actor?.id
+}
+
+// Trả về thread identifier KHỚP với Pancake.thread_id (15-digit Mercury raw thread fbid).
+// Test thực tế Đức Nguyễn (2026-05-16): Pancake.thread_id = thread_key.thread_fbid, ≠ comm_source_id.
+// → ƯU TIÊN thread_fbid, fallback comm_source_id (legacy).
+function extractCommIdFromThread(t) {
+  return t?.thread_key?.thread_fbid || t?.page_comm_item?.comm_source_id
+}
+
+// ============== VAESA BACKEND HELPERS ==============
+// Gọi Cloudflare Pages Functions /api/fb-uid/* — port logic Retion REQUEST_SERVER
+// nhưng KHÔNG cần Authorization (BE chấp nhận CORS open + dữ liệu không nhạy cảm).
+
+async function beGet(path, params = {}) {
+  const url = new URL(`${VAESA_BE_BASE}/${path}`)
+  for (const k of Object.keys(params)) url.searchParams.set(k, params[k])
+  const res = await fetch(url.toString(), { method: 'GET' })
+  if (!res.ok) throw new Error(`BE ${path} HTTP ${res.status}`)
+  return await res.json()
+}
+
+async function bePost(path, body) {
+  const res = await fetch(`${VAESA_BE_BASE}/${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) throw new Error(`BE ${path} HTTP ${res.status}`)
+  return await res.json()
+}
+
+// Lấy meta authoritative từ BE — đây là SOURCE OF TRUTH (giống Retion's get_meta_conversation_info)
+async function beGetMeta(pageId, threadId) {
+  try {
+    const r = await bePost('get-meta', { page_id: pageId, thread_id: threadId })
+    if (r?.ok && r?.hit && r?.row) return r.row
+    return null
+  } catch (e) {
+    console.warn('[VAESA Bridge] BE get-meta fail (sẽ fallback FB):', e?.message || e)
+    return null
+  }
+}
+
+// Đẩy raw conversation lên BE (giống Retion's app/ext/sync_fb_uid)
+async function beSyncRaw(pageId, threads) {
+  try {
+    const r = await bePost('sync', { page_id: pageId, threads })
+    if (!r?.ok) console.warn('[VAESA Bridge] BE sync fail:', r?.error)
+    return r
+  } catch (e) {
+    console.warn('[VAESA Bridge] BE sync exception:', e?.message || e)
+    return { ok: false }
+  }
+}
+
+// Chuyển 1 FB raw thread object → row chuẩn để gửi BE
+function threadToRow(t) {
+  const threadId = t?.page_comm_item?.comm_source_id || t?.thread_key?.thread_fbid
+  if (!threadId) return null
+  const actor = t?.all_participants?.nodes?.[0]?.messaging_actor
+             || t?.all_participants?.edges?.[0]?.node?.messaging_actor
+  const threadKey = (typeof t?.thread_key === 'string')
+    ? t.thread_key
+    : (t?.thread_key?.thread_fbid ? `t_${t.thread_key.thread_fbid}` : null)
+  const updatedMs = parseInt(t?.updated_time_precise) || 0
+  if (!updatedMs) return null
+  return {
+    thread_id: String(threadId),
+    client_uid: actor?.id ? String(actor.id) : null,
+    thread_key: threadKey,
+    customer_name: actor?.name || null,
+    updated_time_ms: updatedMs,
+  }
+}
+
+// lightMode=true: bỏ qua bước paginate scan 20 mẻ (~30s). Dùng cho "warm UID khi mở
+// hội thoại" — chỉ làm tới cursor (~1.5s), không quét rộng, tránh spam FB rate-limit.
+async function calcGlobalUid({ pageId, threadId, lastMessageMs, lightMode }) {
+  if (!pageId) throw new Error('Thiếu pageId')
+  if (!threadId) throw new Error('Thiếu threadId (Pancake conv.thread_id)')
+
+  // 1. Local IDB cache check (fastest path)
+  const cached = await getCachedUid(pageId, threadId)
+  if (cached) return cached
+
+  // 2. BE D1 lookup — authoritative store. Có thể trả về luôn UID, hoặc chỉ trả về
+  //    updated_time_ms để cursor precise FB không lệch.
+  const beRow = await beGetMeta(pageId, threadId)
+  if (beRow?.client_uid) {
+    // Có sẵn UID trên BE → done, cache lại IDB cho lần sau
+    await setCachedUid(pageId, threadId, beRow.client_uid)
+    console.log(`[VAESA Bridge] calcUid OK (BE D1): page=${pageId} thread=${threadId} → ${beRow.client_uid}`)
+    return beRow.client_uid
+  }
+
+  // Nếu BE có timestamp authoritative thì ưu tiên dùng (chính xác hơn Pancake.updated_at).
+  const cursorMs = beRow?.updated_time_ms || lastMessageMs
+
+  // 3. CURSOR CHÍNH XÁC (port chuẩn Retion 0.2.3.1):
+  //    Query `before: cursorMs + 1000, limit: 1` — chỉ chính xác khi cursorMs ≈ FB updated_time
+  //    của đúng thread cần tìm. BE D1 (Phase 1 sync) đảm bảo điều này.
+  if (cursorMs && Number.isFinite(cursorMs) && cursorMs > 0) {
+    try {
+      const { threads } = await fetchThreadBatch(pageId, cursorMs + 1000, 1)
+      if (threads.length === 1) {
+        const t = threads[0]
+        const row = threadToRow(t)
+        // Lưu thread vừa thấy vào BE để build cache dần — kể cả khi không match
+        if (row) bePost('sync', { page_id: pageId, threads: [row] }).catch(() => {})
+        const cs = extractCommIdFromThread(t)
+        if (cs === threadId) {
+          const uid = extractUidFromThread(t)
+          if (uid) {
+            await setCachedUid(pageId, threadId, uid)
+            console.log(`[VAESA Bridge] calcUid OK (cursor): page=${pageId} thread=${threadId} → ${uid} (1 query)`)
+            return uid
+          }
+        } else {
+          console.log(`[VAESA Bridge] cursor không match (cs=${cs} vs ${threadId}) — fallback scan`)
+        }
+      }
+    } catch (e) {
+      console.warn('[VAESA Bridge] cursor query fail, fallback scan:', e?.message || e)
+    }
+  }
+
+  // lightMode: dừng ở đây (chỉ cursor). Warm-on-open không quét rộng.
+  if (lightMode) throw new Error('lightMode: cursor không resolve được, bỏ qua paginate scan')
+
+  // 4. Fallback paginate scan — quét newest ~1000 threads. Mỗi batch đẩy thẳng lên BE
+  //    để Phase 1 sync (initial batch) tự build dần khi user gửi tin nhắn thường ngày.
+  const matchFn = (t) => extractCommIdFromThread(t) === threadId
+
+  let before = Date.now() + 86400000  // +1 day buffer
+  const MAX_PAGES = 20  // max scan ~1000 threads (50/batch)
+  const BATCH_SIZE = 50
+  const seenCommIds = new Set()
+  let totalScanned = 0
+
+  for (let i = 0; i < MAX_PAGES; i++) {
+    const { threads, oldestTime } = await fetchThreadBatch(pageId, before, BATCH_SIZE)
+    if (!threads.length) break
+    totalScanned += threads.length
+
+    // Build cache IDB + đẩy BE cho TẤT CẢ threads scan được
+    const beRows = []
+    for (const t of threads) {
+      const cs = extractCommIdFromThread(t)
+      const uid = extractUidFromThread(t)
+      if (cs && uid && !seenCommIds.has(cs)) {
+        seenCommIds.add(cs)
+        await setCachedUid(pageId, cs, uid)
+      }
+      const row = threadToRow(t)
+      if (row) beRows.push(row)
+    }
+    if (beRows.length) bePost('sync', { page_id: pageId, threads: beRows }).catch(() => {})
+
+    const target = threads.find(matchFn)
+    if (target) {
+      const globalUid = extractUidFromThread(target)
+      if (!globalUid) throw new Error('FB thread không có messaging_actor.id')
+      console.log(`[VAESA Bridge] calcUid OK (scan): page=${pageId} thread=${threadId} → ${globalUid} (sau ${i + 1} batches, ${totalScanned} threads)`)
+      return globalUid
+    }
+
+    if (!oldestTime) break  // không paginate được nữa
+    before = oldestTime  // next batch trước thread cuối cùng
+  }
+
+  throw new Error(`FB không tìm thấy thread ${threadId} trong ${totalScanned} threads gần nhất. KH có thể nằm sâu hơn cap 334 của FB pagination — anh cần chạy "Đồng bộ FB UID" 1 lần trong Cài đặt để quét toàn bộ.`)
+}
+
+// ============== INITIAL SYNC (Phase 1) ==============
+// Port từ Retion SYNC_FB_UID_V2 — quét toàn bộ thread của 1 page, đẩy lên BE D1.
+// Resumable: state lưu trên BE, lần sau chạy tiếp từ cursor đã lưu.
+//
+// Anti rate-limit: delay 2s/batch, retry 2 phút khi FB chặn (giống Retion).
+
+const SYNC_BATCH_LIMIT = 100         // threads per batch (giống Retion LIMIT)
+const SYNC_BATCH_DELAY_MS = 2000     // 2s giữa batches
+const SYNC_RATE_LIMIT_RETRY_MS = 2 * 60 * 1000  // 2 phút khi bị block
+const SYNC_MAX_BATCHES = 500         // safety: ~50k thread per page
+
+const _syncStateInFlight = {}        // pageId → boolean (tránh chạy đồng thời)
+
+async function runInitialSync({ pageId, onProgress }) {
+  if (!pageId) throw new Error('Thiếu pageId')
+  if (_syncStateInFlight[pageId]) {
+    return { ok: false, error: 'Sync đang chạy cho page này, đợi xong rồi chạy lại' }
+  }
+  _syncStateInFlight[pageId] = true
+
+  try {
+    // 1. Đọc state cũ từ BE → resume nếu có cursor dở
+    let state
+    try {
+      const r = await beGet('sync-state', { page_id: pageId })
+      state = r?.state
+    } catch (e) {
+      console.warn('[VAESA Bridge] read sync-state fail (sẽ tạo mới):', e?.message)
+    }
+
+    let cursorBefore = state?.last_cursor_before_ms || (Date.now() + 86400000)
+    let totalSynced = state?.total_synced || 0
+
+    await bePost('sync-state', { page_id: pageId, status: 'running', error_message: null })
+
+    const broadcastProgress = (extra = {}) => {
+      try {
+        chrome.runtime.sendMessage({
+          source: 'vaesa-bridge',
+          event: 'SYNC_FB_UID_PROGRESS',
+          pageId,
+          total_synced: totalSynced,
+          cursor_before_ms: cursorBefore,
+          ...extra,
+        }).catch(() => {})
+      } catch {}
+      if (typeof onProgress === 'function') {
+        try { onProgress({ totalSynced, cursorBefore, ...extra }) } catch {}
+      }
+    }
+
+    let batchIdx = 0
+    let consecutiveEmpty = 0
+
+    while (batchIdx < SYNC_MAX_BATCHES) {
+      let result
+      try {
+        result = await fetchThreadBatch(pageId, cursorBefore, SYNC_BATCH_LIMIT)
+      } catch (e) {
+        const msg = e?.message || String(e)
+        if (msg.includes('rate limit') || msg.includes('something went wrong')) {
+          broadcastProgress({ rate_limited: true })
+          console.warn(`[VAESA Bridge] Rate limit batch ${batchIdx} — đợi 2 phút retry`)
+          await new Promise(r => setTimeout(r, SYNC_RATE_LIMIT_RETRY_MS))
+          continue
+        }
+        // Lỗi khác: dừng + lưu error
+        await bePost('sync-state', { page_id: pageId, status: 'error', error_message: msg }).catch(() => {})
+        broadcastProgress({ error: msg })
+        throw e
+      }
+
+      const { threads, oldestTime } = result
+      if (!threads.length) {
+        consecutiveEmpty++
+        if (consecutiveEmpty >= 2) break
+      } else {
+        consecutiveEmpty = 0
+      }
+
+      // Đẩy raw lên BE (BE tự parse + upsert atomic)
+      if (threads.length) {
+        try {
+          await bePost('sync', { page_id: pageId, raw_conversation: { o0: { data: { viewer: { message_threads: { nodes: threads } } } } } })
+          totalSynced += threads.length
+        } catch (e) {
+          console.warn(`[VAESA Bridge] BE sync batch ${batchIdx} fail:`, e?.message)
+        }
+      }
+
+      // Cache IDB cũng song song
+      for (const t of threads) {
+        const cs = extractCommIdFromThread(t)
+        const uid = extractUidFromThread(t)
+        if (cs && uid) await setCachedUid(pageId, cs, uid)
+      }
+
+      // Next cursor = thread cuối cùng (oldest in batch)
+      if (oldestTime && oldestTime !== cursorBefore) {
+        cursorBefore = oldestTime
+      } else {
+        // không tiến được nữa (FB cap pagination)
+        break
+      }
+
+      // Lưu state để resume
+      await bePost('sync-state', {
+        page_id: pageId,
+        status: 'running',
+        last_cursor_before_ms: cursorBefore,
+        total_synced: totalSynced,
+      }).catch(() => {})
+
+      broadcastProgress({})
+      batchIdx++
+
+      // Delay anti rate-limit
+      await new Promise(r => setTimeout(r, SYNC_BATCH_DELAY_MS))
+    }
+
+    await bePost('sync-state', { page_id: pageId, status: 'done', total_synced: totalSynced }).catch(() => {})
+    broadcastProgress({ done: true })
+    console.log(`[VAESA Bridge] Initial sync xong page=${pageId}: ${totalSynced} threads trong ${batchIdx} batches`)
+    return { ok: true, total_synced: totalSynced, batches: batchIdx }
+  } finally {
+    _syncStateInFlight[pageId] = false
+  }
+}
+
+// ============== COMMENT GLOBAL ID RESOLVER (Phase 1C) ==============
+// Port từ Pancake pancake_business_logic.js getGlobalIdFromComment.
+// Conv bình luận: tải HTML post FB → tìm comment theo legacy_fbid → lấy author.id (UID thật).
+// Bình luận KHÔNG vướng giới hạn 334 của messenger threadlist.
+
+// Trích 1 object JSON cân ngoặc bắt đầu từ vị trí ký tự '{' tại `start`.
+// Port logic BracketStack — bỏ qua ngoặc nằm trong chuỗi.
+function extractBalancedJson(str, start) {
+  let depth = 0, inStr = false, esc = false
+  for (let i = start; i < str.length; i++) {
+    const c = str[i]
+    if (inStr) {
+      if (esc) esc = false
+      else if (c === '\\') esc = true
+      else if (c === '"') inStr = false
+    } else {
+      if (c === '"') inStr = true
+      else if (c === '{') depth++
+      else if (c === '}') { depth--; if (depth === 0) return str.slice(start, i + 1) }
+    }
+  }
+  return null
+}
+
+// Duyệt đệ quy object đã parse, tìm node bình luận có legacy_fbid/id khớp → trả author.id.
+function findCommentAuthorIdDeep(obj, commentId, depth = 0) {
+  if (!obj || typeof obj !== 'object' || depth > 45) return null
+  if ((obj.legacy_fbid != null && String(obj.legacy_fbid) === commentId) ||
+      (obj.id != null && String(obj.id) === commentId)) {
+    const a = obj.author
+    if (a?.id) return String(a.id)
+  }
+  for (const k in obj) {
+    const v = obj[k]
+    if (v && typeof v === 'object') {
+      const r = findCommentAuthorIdDeep(v, commentId, depth + 1)
+      if (r) return r
+    }
+  }
+  return null
+}
+
+// Resolve UID khách từ 1 bình luận.
+//   postId    — Pancake conv.post_id (dạng "{owner}_{postLegacy}") — có thể null
+//   commentId — comment legacy id (= Pancake conv.id phần sau '_')
+async function resolveCommentGlobalId({ postId, commentId }) {
+  if (!commentId) throw new Error('Thiếu commentId')
+  const commentShort = String(commentId).includes('_')
+    ? String(commentId).split('_').pop()
+    : String(commentId)
+  const postShort = postId && String(postId).includes('_')
+    ? String(postId).split('_').pop()
+    : (postId ? String(postId) : null)
+
+  // URL: ưu tiên post + comment_id (FB load đúng comment vào context);
+  // fallback chỉ comment id (FB tự redirect về post).
+  const url = postShort
+    ? `https://www.facebook.com/${postShort}?comment_id=${commentShort}`
+    : `https://www.facebook.com/${commentShort}`
+
+  const res = await fetch(url, {
+    credentials: 'include',
+    headers: {
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'accept-language': 'en-US,en;q=0.9',
+    },
+  })
+  if (!res.ok) throw new Error('FB post HTTP ' + res.status)
+  const html = await res.text()
+
+  // Cách 1: regex thẳng — tìm vị trí legacy_fbid của comment rồi bắt author.id gần đó.
+  // Node comment FB: {"author":{"__typename":"User","id":"<UID>",...},..."legacy_fbid":"<cmt>"...}
+  const marker = `"legacy_fbid":"${commentShort}"`
+  let idx = html.indexOf(marker)
+  if (idx > -1) {
+    // author thường đứng TRƯỚC legacy_fbid trong cùng node → quét ngược ~4000 ký tự
+    const back = html.slice(Math.max(0, idx - 4000), idx)
+    const authorMatches = [...back.matchAll(/"author":\{[^{}]*?"id":"(\d+)"/g)]
+    if (authorMatches.length) return String(authorMatches[authorMatches.length - 1][1])
+    // hoặc author đứng sau
+    const fwd = html.slice(idx, idx + 4000)
+    const fm = fwd.match(/"author":\{[^{}]*?"id":"(\d+)"/)
+    if (fm) return String(fm[1])
+  }
+
+  // Cách 2: parse các khối Relay rồi duyệt đệ quy.
+  const RELAY_RE = /(?:RelayPreloader_\w+|RelayPrefetchedStreamCache)",\[\],(\{)/g
+  let m
+  while ((m = RELAY_RE.exec(html))) {
+    const objStart = m.index + m[0].length - 1
+    const objStr = extractBalancedJson(html, objStart)
+    if (!objStr) continue
+    let parsed
+    try { parsed = JSON.parse(objStr) } catch { continue }
+    const uid = findCommentAuthorIdDeep(parsed, commentShort)
+    if (uid) return uid
+  }
+
+  throw new Error(`Không tìm thấy bình luận ${commentShort} trong post (KH có thể đã xoá comment)`)
+}
+
+// ============== INBOX GLOBAL ID RESOLVER (Phase 1C — inbox) ==============
+// Port từ Pancake: ép FB materialize thread qua business inbox URL → parse HTML.
+// URL: business.facebook.com/latest/inbox/all?asset_id={pageId}&selected_item_id={threadId}
+// → FB nạp chi tiết participant → HTML chứa other_user_id / entity_id / messaging_actor.
+// KHÔNG vướng giới hạn 334 (mở thẳng 1 thread cụ thể).
+
+async function fetchInboxHtml(pageId, threadId) {
+  const url = `https://business.facebook.com/latest/inbox/all?asset_id=${pageId}&selected_item_id=${threadId}`
+  const res = await fetch(url, {
+    credentials: 'include',
+    headers: {
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'accept-language': 'en-US,en;q=0.9',
+    },
+  })
+  if (!res.ok) throw new Error('FB inbox HTTP ' + res.status)
+  return await res.text()
+}
+
+// Trích global_id khách từ HTML inbox. Thử nhiều pattern, loại trừ pageId.
+function extractInboxGlobalId(html, pageId, threadId) {
+  const candidates = new Map()  // id → số lần xuất hiện
+  const add = (id) => {
+    if (!id || id === String(pageId)) return
+    candidates.set(id, (candidates.get(id) || 0) + 1)
+  }
+
+  // Pattern 1: thread_key.other_user_id (chính xác nhất cho thread 1:1)
+  for (const m of html.matchAll(/"other_user_id":"?(\d{6,})"?/g)) add(m[1])
+  // Pattern 2: messaging_actor id
+  for (const m of html.matchAll(/"messaging_actor":\{[^{}]*?"id":"(\d{6,})"/g)) add(m[1])
+  // Pattern 3: entity_id trong context link
+  for (const m of html.matchAll(/entity_id=(\d{6,})/g)) add(m[1])
+  // Pattern 4: setBusinessThreadInfo / thread bootstrap — cặp threadId ↔ id
+  for (const m of html.matchAll(/"thread_fbid":"?(\d{6,})"?[^}]*?"other_user_id":"?(\d{6,})"?/g)) add(m[2])
+
+  // Loại các id rõ ràng không phải khách: pageId, threadId
+  candidates.delete(String(threadId))
+
+  if (!candidates.size) return null
+  // Chọn id xuất hiện nhiều nhất
+  let best = null, bestN = 0
+  for (const [id, n] of candidates) { if (n > bestN) { best = id; bestN = n } }
+  return best
+}
+
+async function resolveInboxGlobalId({ pageId, threadId }) {
+  // TẠM VÔ HIỆU HÓA: parse HTML inbox không đáng tin cậy — fetch thô chỉ trả
+  // bootstrap HTML (sidebar), thread cũ chưa materialize → extractInboxGlobalId
+  // đoán theo "id xuất hiện nhiều nhất" → CÓ THỂ TRẢ NHẦM người khác.
+  // Ghi UID sai = gửi tin nhầm khách. Chặn lại tới khi có cơ chế chuẩn.
+  // (Giữ fetchInboxHtml/extractInboxGlobalId cho việc nghiên cứu sau.)
+  throw new Error('resolveInboxGlobalId: chưa có cơ chế resolve đáng tin cậy cho inbox cũ')
+}
+
+// ============== PHASE 1C — resolve hàng loạt conv comment thiếu UID ==============
+const COMMENT_RESOLVE_DELAY_MS = 1500   // nghỉ giữa mỗi conv (anti rate-limit)
+const COMMENT_RESOLVE_MAX = 1000
+
+async function runCommentResolve({ pageId, onProgress }) {
+  if (!pageId) throw new Error('Thiếu pageId')
+
+  // Lấy danh sách conv thiếu UID từ BE
+  let rows = []
+  try {
+    const r = await beGet('missing', { page_id: pageId, limit: COMMENT_RESOLVE_MAX })
+    rows = (r?.rows || []).filter(x => x.post_id || x.pancake_conv_id)
+  } catch (e) {
+    console.warn('[VAESA Bridge] đọc /missing fail:', e?.message)
+    return { ok: false, error: e?.message }
+  }
+
+  let resolved = 0, failed = 0, idx = 0
+  const broadcast = (extra = {}) => {
+    try {
+      chrome.runtime.sendMessage({
+        source: 'vaesa-bridge', event: 'COMMENT_RESOLVE_PROGRESS',
+        pageId, resolved, failed, total: rows.length, ...extra,
+      }).catch(() => {})
+    } catch {}
+    if (typeof onProgress === 'function') { try { onProgress({ resolved, failed, total: rows.length, ...extra }) } catch {} }
+  }
+
+  for (const row of rows) {
+    idx++
+    try {
+      let uid = null
+      if (row.post_id) {
+        // Conv bình luận → resolve qua comment HTML
+        const convId = row.pancake_conv_id || ''
+        const commentId = convId.includes('_') ? convId.split('_').pop() : (row.page_comm_id || '')
+        if (commentId) uid = await resolveCommentGlobalId({ postId: row.post_id, commentId })
+      } else if (row.thread_id) {
+        // Conv inbox → ép FB materialize thread, parse HTML
+        uid = await resolveInboxGlobalId({ pageId, threadId: row.thread_id })
+      }
+      if (uid) {
+        await bePost('sync', {
+          page_id: pageId,
+          threads: [{ thread_id: row.thread_id, client_uid: uid, updated_time_ms: row.updated_time_ms || Date.now() }],
+        }).catch(() => {})
+        await setCachedUid(pageId, row.thread_id, uid)
+        resolved++
+        console.log(`[VAESA Bridge] Phase1C resolved: ${row.customer_name} → ${uid}`)
+      } else {
+        failed++
+      }
+    } catch (e) {
+      failed++
+      console.warn(`[VAESA Bridge] Phase1C fail ${row.customer_name}:`, e?.message)
+    }
+    broadcast({})
+    await new Promise(r => setTimeout(r, COMMENT_RESOLVE_DELAY_MS))
+  }
+
+  broadcast({ done: true })
+  console.log(`[VAESA Bridge] Phase 1C xong: resolved=${resolved} failed=${failed}/${rows.length}`)
+  return { ok: true, resolved, failed, total: rows.length }
+}
+
+// ============== SEND TEXT (Mercury HTTP minimal) ==============
+// Port từ Retion FacebookPage.sendText. KHÔNG có other_user_fbid / __spin_* / __s / __usid / __dyn / __hsi.
+
+function encodeMessageKey(key) {
+  let result = ''
+  for (; '0' != key; ) {
+    let n = 0
+    let s = ''
+    for (let i = 0; i < key.length; i++) {
+      if ((n = 2 * n + parseInt(key[i], 10)) >= 10) {
+        s = s + '1'
+        n = n - 10
+      } else {
+        s = s + '0'
+      }
+    }
+    result = n.toString() + result
+    key = s.slice(s.indexOf('1'))
+  }
+  return result
+}
+
+function calcMessageKey() {
+  const time = Date.now()
+  const salt = Math.floor(4294967296 * Math.random())
+  const saltStr = ('0000000000000000000000' + salt.toString(2)).slice(-22)
+  return encodeMessageKey((time.toString(2) + saltStr).slice(-63))
+}
+
+async function buildSendBody({ pageId, clientUid, text, imageIds }) {
+  const dtsg = await getDtsg()
+  const messageKey = calcMessageKey()
+  const body = {
+    client_id: 'mercury',
+    action_type: 'ma-type:user-generated-message',
+    source: 'source:page_unified_inbox',
+    message_id: messageKey,
+    offline_threading_id: messageKey,
+    'specific_to_list[0]': `fbid:${clientUid}`,
+    'specific_to_list[1]': `fbid:${pageId}`,
+    timestamp: Date.now(),
+    request_user_id: pageId,
+    fb_dtsg: dtsg,
+    __a: 1,
+    has_attachment: !!(imageIds && imageIds.length),
+  }
+  if (text) body.body = text
+  if (imageIds && imageIds.length) {
+    imageIds.forEach((id, i) => { body[`image_ids[${i}]`] = id })
+  }
+  return body
+}
+
+async function sendFBMessage(body) {
+  const params = new URLSearchParams(body)
+  const res = await fetch(FB_SEND_URL, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params,
+  })
+  const text = await res.text()
+  return { status: res.status, text }
+}
+
+function parseFBResponse(text) {
+  if (!text) return { ok: false, error: 'Empty response' }
+  if (text.includes('"payload":{"error_payload":true}')) return { ok: false, error: 'FB error_payload' }
+  if (text.includes('Not Found <br')) return { ok: false, error: 'FB Not Found' }
+  if (text.includes('"errorSummary":')) {
+    const summary = text.match(/"errorSummary":"([^"]+)"/)?.[1]
+    const errCode = text.match(/"error":(\d+)/)?.[1]
+    const desc = text.match(/"errorDescription":"([^"]+)"/)?.[1]
+    return { ok: false, error: `FB ${errCode || ''}: ${desc || summary || 'unknown'}`, raw: text.slice(0, 400) }
+  }
+  try {
+    const clean = text.replace(/^for ?\(;;\);/, '')
+    const json = JSON.parse(clean)
+    if (json?.payload) return { ok: true, payload: json.payload }
+    return { ok: false, error: 'No payload in response' }
+  } catch {
+    return { ok: false, error: 'Parse fail', raw: text.slice(0, 300) }
+  }
+}
+
+// ============== UPLOAD FILE (mercury/upload.php) ==============
+// Port từ Retion FacebookPage.#updateOneFile
+
+async function uploadOneFile({ pageId, fileBase64, fileMime, fileName }) {
+  const dtsg = await getDtsg()
+  const url = new URL(FB_UPLOAD_URL)
+  url.searchParams.set('__a', '1')
+  url.searchParams.set('fb_dtsg', dtsg)
+  url.searchParams.set('request_user_id', pageId)
+
+  // Convert base64 → Blob
+  const binaryString = atob(fileBase64)
+  const bytes = new Uint8Array(binaryString.length)
+  for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i)
+  const blob = new Blob([bytes], { type: fileMime || 'image/jpeg' })
+
+  const formData = new FormData()
+  formData.append('file', blob, fileName || 'image.jpg')
+
+  const res = await fetch(url.toString(), {
+    method: 'POST',
+    credentials: 'include',
+    body: formData,
+  })
+  const text = await res.text()
+
+  if (!text || text.includes('"errorSummary":"Sorry, something went wrong"')) {
+    throw new Error('Upload failed')
+  }
+  if (text.includes('Insufficient Permission')) {
+    throw new Error('Upload no permission — anh không phải admin page')
+  }
+
+  const json = JSON.parse(text.replace(/^for ?\(;;\);/, ''))
+  const imageId = json?.payload?.metadata?.[0]?.image_id
+  if (!imageId) throw new Error('Upload không trả image_id')
+  return imageId
+}
+
+// ============== MQTT TIER 2 (FB WebSocket) ==============
+// Port từ Retion injectedWs.js. Adapted cho SW (self.WebSocket thay window).
+// Trigger: HTTP Mercury fail với error_code 1545041 ("Người này không có mặt").
+// Open WSS đến wss://edge-chat.facebook.com → MQTT v3.1 → PUBLISH /ls_req task 46.
+
+const FB_WS_APP_ID = 514771569228061
+const FB_WS_TOPIC = '/ls_req'
+const FB_WS_VERSION_ID = '26103499605907680'
+const _wsConn = {}        // pageId → { ws, sid, cid, ready: Promise }
+const _wsHeartbeat = {}    // pageId → interval handle
+let _wsEpochCounter = 0
+let _wsTaskId = 0
+let _wsRequestId = 0
+
+function _wsEpochId() {
+  return Math.floor(Date.now() * (4194304 + (_wsEpochCounter = (_wsEpochCounter + 0.1) % 5)))
+}
+function _wsRandSafe() {
+  return Math.floor(Math.random() * Number.MAX_SAFE_INTEGER)
+}
+function _wsUuid() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = Math.random() * 16 | 0
+    return (c === 'x' ? r : (r & 3) | 8).toString(16)
+  })
+}
+
+// MQTT v3 CONNECT packet — verbatim port từ Retion R() function
+function _mqttBuildConnect(connectPayload) {
+  const enc = new TextEncoder()
+  const proto = enc.encode('MQIsdp')
+  const protoVer = 3
+  const flags = 130           // username flag + clean session
+  const keepAlive = [0, 15]
+  const clientId = enc.encode('mqttwsclient')
+  const payload = enc.encode(JSON.stringify(connectPayload))
+  const varHeader = [0, proto.length, ...proto, protoVer, flags, ...keepAlive]
+  const body = [
+    clientId.length >> 8 & 255, clientId.length & 255, ...clientId,
+    payload.length >> 8 & 255, payload.length & 255, ...payload,
+  ]
+  const remaining = varHeader.length + body.length
+  const lenBytes = []
+  let r = remaining
+  do {
+    let b = r % 128
+    r = Math.floor(r / 128)
+    if (r > 0) b |= 128
+    lenBytes.push(b)
+  } while (r > 0)
+  return new Uint8Array([16, ...lenBytes, ...varHeader, ...body])
+}
+
+// MQTT PUBLISH topic = string, payload = JSON object (Retion X())
+function _mqttPublishString(topic, payloadStr) {
+  const enc = new TextEncoder()
+  const topicBytes = enc.encode(topic)
+  const topicLen = topicBytes.length
+  const payloadObj = typeof payloadStr === 'string' ? payloadStr : JSON.stringify(payloadStr)
+  const payloadBytes = enc.encode(payloadObj)
+  const packetId = [0, 1]
+  const total = 2 + topicLen + packetId.length + payloadBytes.length
+  const lenBytes = []
+  let r = total
+  do {
+    let b = r % 128
+    r = Math.floor(r / 128)
+    if (r > 0) b |= 128
+    lenBytes.push(b)
+  } while (r > 0)
+  const out = new Uint8Array(1 + lenBytes.length + 2 + topicLen + 2 + payloadBytes.length)
+  let pos = 0
+  out[pos++] = 50           // PUBLISH QoS 1
+  for (const b of lenBytes) out[pos++] = b
+  out[pos++] = topicLen >> 8 & 255
+  out[pos++] = topicLen & 255
+  out.set(topicBytes, pos); pos += topicLen
+  out[pos++] = packetId[0]
+  out[pos++] = packetId[1]
+  out.set(payloadBytes, pos)
+  return out
+}
+
+// MQTT SUBSCRIBE (Retion C())
+function _mqttSubscribe(topic, packetId = 2) {
+  const enc = new TextEncoder()
+  const topicBytes = enc.encode(topic)
+  const topicLen = topicBytes.length
+  const fixedHeader = 130
+  const remaining = 4 + topicLen + 1
+  const lenBytes = []
+  let r = remaining
+  do {
+    let b = r % 128
+    r = Math.floor(r / 128)
+    if (r > 0) b |= 128
+    lenBytes.push(b)
+  } while (r > 0)
+  const out = new Uint8Array(1 + lenBytes.length + 2 + 2 + topicLen + 1)
+  let pos = 0
+  out[pos++] = fixedHeader
+  for (const b of lenBytes) out[pos++] = b
+  out[pos++] = packetId >> 8 & 255
+  out[pos++] = packetId & 255
+  out[pos++] = topicLen >> 8 & 255
+  out[pos++] = topicLen & 255
+  out.set(topicBytes, pos); pos += topicLen
+  out[pos++] = 0           // QoS 0
+  return out
+}
+
+// MQTT PUBLISH tasks (Retion V()) — wrap payload.payload thành JSON string
+function _mqttPublishTaskWrapped(topic, taskObj, packetType = 50, packetId = 11) {
+  const enc = new TextEncoder()
+  const topicBytes = enc.encode(topic)
+  const wrapped = { ...taskObj, payload: JSON.stringify(taskObj.payload) }
+  const body = enc.encode(JSON.stringify(wrapped))
+  const topicLen = topicBytes.length
+  const hasPid = (packetType & 6) > 0
+  const varHeader = 2 + topicLen + (hasPid ? 2 : 0)
+  const total = varHeader + body.length
+  const lenBytes = []
+  let r = total
+  do {
+    let b = r % 128
+    r = Math.floor(r / 128)
+    if (r > 0) b |= 128
+    lenBytes.push(b)
+  } while (r > 0)
+  const out = new Uint8Array(1 + lenBytes.length + varHeader + body.length)
+  let pos = 0
+  out[pos++] = packetType
+  for (const b of lenBytes) out[pos++] = b
+  out[pos++] = topicLen >> 8 & 255
+  out[pos++] = topicLen & 255
+  out.set(topicBytes, pos); pos += topicLen
+  if (hasPid) {
+    out[pos++] = packetId >> 8 & 255
+    out[pos++] = packetId & 255
+  }
+  out.set(body, pos)
+  return out
+}
+
+// MQTT PINGREQ
+function _mqttPingReq() {
+  return new Uint8Array([192, 0])
+}
+
+async function _wsConnectOrReuse(pageId, currentUid) {
+  const existing = _wsConn[pageId]
+  if (existing?.ws?.readyState === WebSocket.OPEN) return existing.ws
+  if (existing?.ready) {
+    try { await existing.ready; if (existing.ws.readyState === WebSocket.OPEN) return existing.ws } catch {}
+  }
+  const sid = _wsRandSafe()
+  const cid = _wsUuid()
+  const url = `wss://edge-chat.facebook.com/chat?region=prn&sid=${sid}&cid=${cid}`
+  const ws = new WebSocket(url)
+  ws.binaryType = 'arraybuffer'
+
+  const ready = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('WS connect timeout 10s')), 10000)
+    ws.addEventListener('open', () => {
+      clearTimeout(timer)
+      const connectPayload = {
+        a: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        asi: null,
+        aid: FB_WS_APP_ID,
+        aids: { PAGE: String(pageId) },
+        chat_on: false,
+        cp: 3,
+        ct: 'websocket',
+        d: cid,
+        dc: '',
+        ecp: 10,
+        fg: true,
+        gas: null,
+        mqtt_sid: '',
+        no_auto_fg: true,
+        p: String(pageId),
+        pack: [],
+        php_override: '',
+        pm: [],
+        s: sid,
+        st: [],
+        u: String(currentUid),
+      }
+      ws.send(_mqttBuildConnect(connectPayload))
+      setTimeout(() => {
+        try {
+          ws.send(_mqttPublishString('/ls_app_settings', { ls_fdid: '', ls_sv: FB_WS_VERSION_ID }))
+          ws.send(_mqttSubscribe('/ls_foreground_state'))
+          ws.send(_mqttSubscribe('/ls_resp', 3))
+        } catch {}
+      }, 100)
+      resolve()
+    }, { once: true })
+    ws.addEventListener('error', (e) => {
+      clearTimeout(timer)
+      reject(new Error('WS error: ' + (e?.message || 'unknown')))
+    }, { once: true })
+  })
+
+  _wsConn[pageId] = { ws, sid, cid, ready }
+  ws.addEventListener('close', () => {
+    if (_wsConn[pageId]?.ws === ws) delete _wsConn[pageId]
+    if (_wsHeartbeat[pageId]) { clearInterval(_wsHeartbeat[pageId]); delete _wsHeartbeat[pageId] }
+  })
+
+  if (!_wsHeartbeat[pageId]) {
+    _wsHeartbeat[pageId] = setInterval(() => {
+      try {
+        if (ws.readyState === WebSocket.OPEN) ws.send(_mqttPingReq())
+        else { clearInterval(_wsHeartbeat[pageId]); delete _wsHeartbeat[pageId] }
+      } catch {}
+    }, 15000)
+  }
+
+  await ready
+  return ws
+}
+
+async function sendViaMqtt({ pageId, threadId, lastMessageMs, body, clientUid: clientUidArg }) {
+  if (!pageId) throw new Error('Thiếu pageId')
+  if (!threadId) throw new Error('Thiếu threadId')
+  if (!body) throw new Error('MQTT hiện chỉ hỗ trợ text (chưa port upload qua MQTT)')
+
+  const currentUid = await getCurrentUid()
+  if (!currentUid) throw new Error('Chưa scrape được FB current UID')
+
+  // thread_id của task-46 MQTT = UID khách (FB 1:1 thread định danh bằng other_user_id),
+  // KHÔNG phải Pancake thread_id. Port chuẩn Retion injectedWs.js (dùng client_uid).
+  const clientUid = clientUidArg || await calcGlobalUid({ pageId, threadId, lastMessageMs })
+  if (!clientUid) throw new Error('MQTT: không resolve được UID khách')
+
+  const ws = await _wsConnectOrReuse(pageId, currentUid)
+
+  _wsRequestId++
+  const task = {
+    app_id: String(FB_WS_APP_ID),
+    payload: {
+      epoch_id: _wsEpochId(),
+      tasks: [
+        {
+          failure_count: null,
+          label: '46',
+          payload: JSON.stringify({
+            thread_id: String(clientUid),
+            otid: _wsEpochId(),
+            source: 0,
+            send_type: 1,
+            sync_group: 205,
+            mark_thread_read: 1,
+            text: body,
+          }),
+          queue_name: String(clientUid),
+          task_id: ++_wsTaskId,
+        },
+        {
+          failure_count: null,
+          label: '21',
+          payload: JSON.stringify({
+            thread_id: String(clientUid),
+            last_read_watermark_ts: Date.now(),
+            sync_group: 205,
+          }),
+          queue_name: String(clientUid),
+          task_id: ++_wsTaskId,
+        },
+      ],
+      version_id: FB_WS_VERSION_ID,
+    },
+    request_id: _wsRequestId,
+    type: 3,
+  }
+
+  const packet = _mqttPublishTaskWrapped(FB_WS_TOPIC, task, 50, _wsRequestId > 10 ? 11 : _wsRequestId)
+  ws.send(packet)
+
+  // FB MQTT không có ack reliable cho task 46 từ ngoài, đợi 1.2s xem WS có disconnect không
+  // Retion làm tương tự — fire & forget.
+  await new Promise(resolve => setTimeout(resolve, 1200))
+  if (ws.readyState !== WebSocket.OPEN) throw new Error('MQTT WS đóng ngay sau send — fail')
+  return { ok: true, via: 'mqtt', threadId, requestId: _wsRequestId }
+}
+
+async function actionSendTextMqtt({ pageId, threadId, body }) {
+  return await sendViaMqtt({ pageId, threadId, body })
+}
+
+// ============== TOP-LEVEL ACTIONS ==============
+
+async function actionSendText({ pageId, threadId, lastMessageMs, body }) {
+  // Gửi qua HTTP Mercury (DTSG) — giống hệt Retion (Retion cũng chỉ httpPost, không MQTT).
+  const clientUid = await calcGlobalUid({ pageId, threadId, lastMessageMs })
+  const sendBody = await buildSendBody({ pageId, clientUid, text: body })
+  const { text } = await sendFBMessage(sendBody)
+  const parsed = parseFBResponse(text)
+  if (!parsed.ok) throw new Error(parsed.error || 'Gửi thất bại')
+  return { ok: true, clientUid, payload: parsed.payload }
+}
+
+async function actionSendFile({ pageId, threadId, lastMessageMs, body, files }) {
+  const clientUid = await calcGlobalUid({ pageId, threadId, lastMessageMs })
+
+  // Upload từng file
+  const imageIds = []
+  for (const f of files || []) {
+    try {
+      const id = await uploadOneFile({
+        pageId,
+        fileBase64: f.data,
+        fileMime: f.type,
+        fileName: f.name,
+      })
+      if (id) imageIds.push(id)
+    } catch (e) {
+      console.warn('[VAESA Bridge] upload 1 file fail:', e?.message || e)
+    }
+  }
+  if (!imageIds.length) throw new Error('Không upload được file nào')
+
+  const sendBody = await buildSendBody({ pageId, clientUid, text: body, imageIds })
+  const { text } = await sendFBMessage(sendBody)
+  const parsed = parseFBResponse(text)
+  if (!parsed.ok) throw new Error(parsed.error || 'Gửi thất bại')
+  return { ok: true, clientUid, imageIds, payload: parsed.payload }
+}
+
+async function actionStatus() {
+  try {
+    const fbCookie = await chrome.cookies.get({ url: 'https://www.facebook.com', name: 'c_user' })
+    return {
+      ok: true,
+      version: chrome.runtime.getManifest().version,
+      cUser: fbCookie?.value || null,
+      dtsgCached: !!(_fbUser.dtsg && _fbUser.ttl > Date.now()),
+      dtsgAgeMin: _fbUser.ttl ? Math.max(0, Math.round((_fbUser.ttl - Date.now()) / 60000)) : null,
+      currentUID: _fbUser.currentUID || null,
+    }
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) }
+  }
+}
+
+// ============== MESSAGE LISTENER ==============
+
+chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
+  console.log('[VAESA Bridge] msg in:', req?.action)
+  const dispatch = async () => {
+    switch (req?.action) {
+      case 'VAESA_PING':
+        return { ok: true, version: chrome.runtime.getManifest().version, alive: true }
+      case 'VAESA_STATUS':
+        return await actionStatus()
+      case 'VAESA_REFRESH_DTSG':
+        await loadDtsg()
+        return { ok: true }
+      case 'VAESA_CALC_UID':
+        return { ok: true, globalUid: await calcGlobalUid(req.payload || {}) }
+      case 'VAESA_WARM_UID': {
+        // Warm UID khi NV mở hội thoại — light mode (cursor, không paginate).
+        // Resolve được → write-through D1 (đã có sẵn trong calcGlobalUid). Fail thì im lặng.
+        try {
+          const uid = await calcGlobalUid({ ...(req.payload || {}), lightMode: true })
+          return { ok: true, globalUid: uid, warmed: true }
+        } catch (e) {
+          return { ok: true, warmed: false, reason: String(e?.message || e) }
+        }
+      }
+      case 'VAESA_DEBUG_DNR': {
+        // Debug — dump DNR rules + matched rules để xác minh rule edge-chat có áp dụng không.
+        const rules = await chrome.declarativeNetRequest.getDynamicRules()
+        let matched = null
+        try {
+          const mr = await chrome.declarativeNetRequest.getMatchedRules({})
+          matched = mr?.rulesMatchedInfo?.map(x => ({ id: x.rule?.ruleId, ts: x.timeStamp })) || []
+        } catch (e) { matched = 'err: ' + String(e?.message || e) }
+        return {
+          ok: true,
+          ruleCount: rules.length,
+          wsRule: rules.find(r => r.condition?.resourceTypes?.includes('websocket') && /edge-chat/.test(r.condition?.urlFilter || '')) || null,
+          matched,
+        }
+      }
+      case 'VAESA_WARM_SOCKET': {
+        // Mở sẵn MQTT WebSocket cho page khi NV mở hội thoại — gửi sau sẽ tức thì.
+        // Reuse nếu socket đang OPEN. Fail thì im lặng (gửi vẫn fallback HTTP).
+        try {
+          const { pageId } = req.payload || {}
+          if (!pageId) return { ok: true, warmed: false, reason: 'Thiếu pageId' }
+          const currentUid = await getCurrentUid()
+          if (!currentUid) return { ok: true, warmed: false, reason: 'Chưa scrape FB UID' }
+          await _wsConnectOrReuse(pageId, currentUid)
+          return { ok: true, warmed: true }
+        } catch (e) {
+          return { ok: true, warmed: false, reason: String(e?.message || e) }
+        }
+      }
+      case 'VAESA_SEND_TEXT':
+        return await actionSendText(req.payload || {})
+      case 'VAESA_SEND_FILE':
+        return await actionSendFile(req.payload || {})
+      case 'VAESA_SEND_TEXT_MQTT':
+        return await actionSendTextMqtt(req.payload || {})
+      case 'VAESA_CLEAR_UID_CACHE': {
+        const cleared = await idbClear()
+        // Legacy: cũng dọn chrome.storage.local từ v3.0.x trước khi đổi sang IDB.
+        const all = await chrome.storage.local.get(null)
+        const legacyKeys = Object.keys(all).filter(k => k.startsWith('vaesa_uid_v3:'))
+        if (legacyKeys.length) await chrome.storage.local.remove(legacyKeys)
+        return { ok: true, cleared: cleared + legacyKeys.length }
+      }
+      case 'VAESA_RUN_INITIAL_SYNC':
+        // Async: fire-and-forget, progress qua chrome.runtime.sendMessage broadcast.
+        runInitialSync(req.payload || {}).catch((e) => console.error('[VAESA Bridge] sync error:', e?.message || e))
+        return { ok: true, started: true }
+      case 'VAESA_RUN_COMMENT_RESOLVE':
+        runCommentResolve(req.payload || {}).catch((e) => console.error('[VAESA Bridge] comment resolve error:', e?.message || e))
+        return { ok: true, started: true }
+      case 'VAESA_RESOLVE_ONE_COMMENT':
+        // Resolve 1 conv comment on-demand, trả UID ngay.
+        return { ok: true, globalUid: await resolveCommentGlobalId(req.payload || {}) }
+      case 'VAESA_GET_SYNC_STATE':
+        return await beGet('sync-state', { page_id: req.payload?.pageId || '' })
+      case 'VAESA_RELOAD_SELF':
+        // Tự reload extension — nạp lại code mới từ disk (unpacked ext).
+        // Trả response TRƯỚC khi reload để webapp biết lệnh đã nhận.
+        setTimeout(() => chrome.runtime.reload(), 300)
+        return { ok: true, reloading: true }
+      case 'VAESA_DEBUG_DUMP_THREAD': {
+        // Debug only — fetch 1 raw thread of page và trả về toàn bộ object để inspect shape.
+        const { pageId, beforeMs } = req.payload || {}
+        const { threads } = await fetchThreadBatch(pageId, beforeMs || (Date.now() + 86400000), 1)
+        return { ok: true, raw: threads[0] || null, keys: threads[0] ? Object.keys(threads[0]) : [] }
+      }
+      case 'VAESA_DEBUG_INBOX_HTML': {
+        // Debug — fetch inbox HTML, trả về candidate IDs để tinh chỉnh parser.
+        const { pageId, threadId } = req.payload || {}
+        const html = await fetchInboxHtml(pageId, threadId)
+        const grab = (re, n = 8) => [...new Set([...html.matchAll(re)].map(m => m[1]))].slice(0, n)
+        return {
+          ok: true,
+          htmlLen: html.length,
+          other_user_id: grab(/"other_user_id":"?(\d{6,})"?/g),
+          messaging_actor: grab(/"messaging_actor":\{[^{}]*?"id":"(\d{6,})"/g),
+          entity_id: grab(/entity_id=(\d{6,})/g),
+          thread_fbid: grab(/"thread_fbid":"?(\d{6,})"?/g),
+          parsed: extractInboxGlobalId(html, pageId, threadId),
+        }
+      }
+      default:
+        return { ok: false, error: 'Unknown action: ' + req?.action }
+    }
+  }
+  dispatch().then(sendResponse).catch((e) => {
+    console.error('[VAESA Bridge] action error:', e?.message || e)
+    sendResponse({ ok: false, error: String(e?.message || e) })
+  })
+  return true
+})
