@@ -31,6 +31,7 @@ const ACTION_MAP = {
   RUN_COMMENT_RESOLVE: 'VAESA_RUN_COMMENT_RESOLVE',
   RESOLVE_ONE_COMMENT: 'VAESA_RESOLVE_ONE_COMMENT',
   DEBUG_INBOX_HTML: 'VAESA_DEBUG_INBOX_HTML',
+  CRAWL_MBS: 'VAESA_CRAWL_MBS',
 }
 
 // Background → page push (sync progress, MQTT events...). Forward sang webapp qua postMessage.
@@ -44,6 +45,13 @@ window.addEventListener('message', (e) => {
   if (e.source !== window) return
   const msg = e.data
   if (!msg || msg.source !== 'vaesa-app') return
+
+  // Content script này bị orphan (extension đã reload) → im lặng, nhường cho
+  // bản content.js mới (background re-inject khi onInstalled). Tránh trả lỗi
+  // "Extension context invalidated".
+  let ctxAlive = false
+  try { ctxAlive = !!(chrome.runtime && chrome.runtime.id) } catch (err) {}
+  if (!ctxAlive) return
 
   const reqId = msg.reqId
   const respond = (result) => {

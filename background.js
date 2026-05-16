@@ -1306,6 +1306,256 @@ async function actionStatus() {
 
 // ============== MESSAGE LISTENER ==============
 
+// ============== CRAWL META BUSINESS SUITE ==============
+// Đọc danh sách hội thoại (threadList) từ React của trang MBS.
+// Mở MBS trong 1 cửa sổ minimized → executeScript world MAIN đọc React fiber →
+// trả [{name, uid, snippet, ts}] → đóng cửa sổ. uid = threadFBID = UID FB thật.
+
+// ===== BẢN NHANH: gọi thẳng GraphQL search của MBS (~1-2s, không mở cửa sổ) =====
+// Đã verify 2026-05-17: param BẮT BUỘC `av`=pageID (act-as-page) + header x-fb-lsd.
+// Lấy fb_dtsg + lsd tươi từ trang business.facebook.com.
+async function mbsFetchTokens() {
+  const res = await fetch('https://business.facebook.com/latest/home', { credentials: 'include' })
+  const html = await res.text()
+  const dm = html.match(/"DTSGInitialData",\[\],\{"token":"([^"]+)"/)
+  let lm = html.match(/\["LSD",\[\],\{"token":"([^"]+)"/)
+  if (!lm) lm = html.match(/"lsd":\{"token":"([^"]+)"/)
+  if (!dm) throw new Error('Không lấy được fb_dtsg từ business.facebook.com')
+  if (!lm) throw new Error('Không lấy được lsd từ business.facebook.com')
+  return { dtsg: dm[1], lsd: lm[1] }
+}
+
+// Gọi BizInboxCustomerRelaySearchSourceQuery → tìm khách theo tên.
+// Trả [{name, uid, username}]. uid = data.page.page_unified_customer_search.edges[].node.user.id
+async function mbsSearchUid(pageId, searchTerm) {
+  const { dtsg, lsd } = await mbsFetchTokens()
+  const body = new URLSearchParams()
+  body.set('av', String(pageId)) // BẮT BUỘC — act as page, thiếu thì trả rỗng
+  body.set('fb_dtsg', dtsg)
+  body.set('lsd', lsd)
+  body.set('fb_api_caller_class', 'RelayModern')
+  body.set('fb_api_req_friendly_name', 'BizInboxCustomerRelaySearchSourceQuery')
+  body.set('variables', JSON.stringify({
+    pageID: String(pageId), count: 10, cursor: null,
+    searchTerm: String(searchTerm), channel: 'ALL', selectedIgAssetId: null,
+  }))
+  body.set('doc_id', '26057142707244566')
+  const res = await fetch('https://business.facebook.com/api/graphql/', {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+      'x-fb-friendly-name': 'BizInboxCustomerRelaySearchSourceQuery',
+      'x-fb-lsd': lsd,
+      'x-asbd-id': '359341',
+    },
+    body: body.toString(),
+  })
+  const txt = await res.text()
+  let data
+  try { data = JSON.parse(txt) } catch (e) { throw new Error('GraphQL trả về không phải JSON (HTTP ' + res.status + ')') }
+  if (data?.errors?.length) throw new Error('GraphQL error: ' + (data.errors[0]?.message || 'unknown'))
+  const edges = data?.data?.page?.page_unified_customer_search?.edges || []
+  return edges
+    .map((e) => ({
+      name: e?.node?.name || '',
+      uid: String(e?.node?.user?.id || ''),
+      username: e?.node?.user?.username || '',
+    }))
+    .filter((x) => x.uid)
+}
+
+// Hàm chạy TRONG trang MBS (world MAIN) — phải tự chứa, không tham chiếu ngoài.
+// Quét MỌI React root (FB Comet có nhiều root) → lấy threadList (inbox mặc định,
+// mỗi item có threadFBID = UID) + entry.messengerThreadID (kết quả ô tìm kiếm).
+function mbsExtractThreadList() {
+  function getFiber(el) {
+    const k = Object.keys(el).find((x) => x.startsWith('__reactFiber$'))
+    return k ? el[k] : null
+  }
+  function elText(n) {
+    if (n == null) return ''
+    if (typeof n === 'string' || typeof n === 'number') return String(n)
+    if (Array.isArray(n)) return n.map(elText).join('')
+    if (n && n.props && n.props.children !== undefined) return elText(n.props.children)
+    return ''
+  }
+  const roots = []
+  for (const el of document.querySelectorAll('body *')) {
+    for (const k in el) {
+      if (k.startsWith('__reactContainer$')) {
+        try { const c = el[k]; if (c && c.current) roots.push(c.current) } catch (e) {}
+      }
+    }
+    if (roots.length > 40) break
+  }
+  if (!roots.length) {
+    for (const el of document.querySelectorAll('div,span,li')) {
+      const f = getFiber(el)
+      if (f) { let r = f, u = 0; while (r.return && u < 30000) { r = r.return; u++ } roots.push(r); break }
+    }
+  }
+  let threadList = null
+  const entries = []
+  const seenE = new WeakSet()
+  for (const root of roots) {
+    const stack = [root]
+    let guard = 0
+    while (stack.length && guard < 250000) {
+      guard++
+      const f = stack.pop()
+      if (!f) continue
+      const p = f.memoizedProps
+      if (p && typeof p === 'object') {
+        if (!threadList && Array.isArray(p.threadList) && p.threadList[0] && p.threadList[0].threadFBID) {
+          threadList = p.threadList
+        }
+        const e = p.entry
+        if (e && typeof e === 'object' && e.messengerThreadID && !seenE.has(e)) {
+          seenE.add(e); entries.push(e)
+        }
+      }
+      if (f.child) stack.push(f.child)
+      if (f.sibling) stack.push(f.sibling)
+    }
+  }
+  const out = []
+  if (threadList) {
+    for (const t of threadList) {
+      if (!t || !t.threadFBID) continue
+      let sn = ''
+      try { sn = elText(t.snippet).replace(/\s+/g, ' ').trim() } catch (e) {}
+      out.push({ name: t.title || '', uid: String(t.threadFBID), snippet: sn.slice(0, 80), ts: Number(t.timestamp) || 0, src: 'list' })
+    }
+  }
+  for (const e of entries) {
+    out.push({ name: '', uid: String(e.messengerThreadID), snippet: '', ts: 0, src: 'search' })
+  }
+  if (!out.length) {
+    let loginish = false
+    try { loginish = !!document.querySelector('input[type="password"],input[name="email"],form[action*="login"]') } catch (e) {}
+    return {
+      ok: false, threads: [], searchCount: 0,
+      diag: {
+        title: (document.title || '').slice(0, 50),
+        rootCount: roots.length,
+        loginish,
+        bodyLen: ((document.body && document.body.innerText) || '').length,
+      },
+    }
+  }
+  return { ok: true, threads: out, hasList: !!threadList, searchCount: entries.length }
+}
+
+// Gõ từ khoá vào ô tìm kiếm MBS (chạy world MAIN).
+function mbsTypeSearch(query) {
+  const inp = [...document.querySelectorAll('input')].find((i) => {
+    const s = (i.placeholder || '') + ' ' + (i.getAttribute('aria-label') || '')
+    return /Tìm kiếm|Search/i.test(s)
+  })
+  if (!inp) return { ok: false }
+  inp.focus()
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set
+  setter.call(inp, query)
+  inp.dispatchEvent(new Event('input', { bubbles: true }))
+  inp.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'a' }))
+  inp.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'a' }))
+  return { ok: true }
+}
+
+// payload: { pageId, query? } — query có → tìm kiếm trong MBS để quét user bất kỳ.
+async function actionCrawlMbs(payload) {
+  const pageId = String(payload?.pageId || '')
+  const query = String(payload?.query || '').trim()
+  if (!pageId) return { ok: false, error: 'Thiếu pageId' }
+  console.log('[VAESA MBS] crawl start', { pageId, query })
+  // BẢN NHANH — có query → gọi GraphQL search trực tiếp (~1-2s, KHÔNG mở cửa sổ).
+  // Luôn trả kết quả/lỗi ở đây, không rơi xuống cửa sổ nữa.
+  if (query) {
+    try {
+      const results = await mbsSearchUid(pageId, query)
+      console.log('[VAESA MBS] graphql search', { hits: results.length })
+      return {
+        ok: true, mode: 'search', searchCount: results.length,
+        threads: results.map((r) => ({ name: r.name, uid: r.uid, username: r.username, snippet: '', ts: 0, src: 'search' })),
+      }
+    } catch (e) {
+      console.log('[VAESA MBS] graphql search FAIL:', String(e?.message || e))
+      return { ok: false, error: 'MBS search: ' + String(e?.message || e) }
+    }
+  }
+  const url = `https://business.facebook.com/latest/inbox/all/?asset_id=${encodeURIComponent(pageId)}&mailbox_id=${encodeURIComponent(pageId)}`
+  let winId = null
+  let tabId = null
+  try {
+    // Cửa sổ MBS phải FOCUS — minimized/không-focus bị Chrome throttle, FB Comet
+    // không bung được danh sách hội thoại. Mở cửa sổ nhỏ ở góc, sẽ tự đóng sau ~1 phút.
+    const win = await chrome.windows.create({ url, focused: true, width: 560, height: 680, top: 24, left: 24 })
+    winId = win?.id
+    tabId = win?.tabs?.[0]?.id
+    if (!tabId) return { ok: false, error: 'Không mở được MBS' }
+    await new Promise((resolve, reject) => {
+      const to = setTimeout(() => { done(); reject(new Error('MBS tải quá lâu')) }, 30000)
+      function onUpd(id, info) { if (id === tabId && info.status === 'complete') { done(); resolve() } }
+      function done() { clearTimeout(to); chrome.tabs.onUpdated.removeListener(onUpd) }
+      chrome.tabs.onUpdated.addListener(onUpd)
+    })
+    // Có query → gõ vào ô tìm kiếm MBS (sau khi trang render xong)
+    if (query) {
+      await new Promise((r) => setTimeout(r, 3000))
+      for (let i = 0; i < 5; i++) {
+        try {
+          const o = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: mbsTypeSearch, args: [query] })
+          if (o?.[0]?.result?.ok) break
+        } catch (e) {}
+        await new Promise((r) => setTimeout(r, 1000))
+      }
+      await new Promise((r) => setTimeout(r, 4000)) // chờ kết quả tìm kiếm
+    }
+    // Chờ FB Comet bung app inbox rồi mới poll
+    await new Promise((r) => setTimeout(r, 4000))
+    // Poll executeScript tới khi đọc được dữ liệu (FB Comet render chậm)
+    let result = null
+    let lastRes = null
+    for (let i = 0; i < 45; i++) {
+      await new Promise((r) => setTimeout(r, 1500))
+      try {
+        const out = await chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: mbsExtractThreadList })
+        const res = out?.[0]?.result
+        if (res) {
+          lastRes = res
+          if (res.ok && (query ? res.searchCount > 0 : res.threads.length)) { result = res; break }
+        }
+      } catch (e) {}
+    }
+    if (!result) {
+      const d = lastRes?.diag
+      console.log('[VAESA MBS] crawl FAIL', d)
+      return { ok: false, error: 'Không đọc được dữ liệu MBS' + (d ? ' — ' + JSON.stringify(d) : ' (timeout/không render)') }
+    }
+    console.log('[VAESA MBS] crawl done', { mode: query ? 'search' : 'list', threads: result.threads.length, searchCount: result.searchCount })
+    return { ok: true, threads: result.threads, mode: query ? 'search' : 'list', searchCount: result.searchCount || 0 }
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) }
+  } finally {
+    if (winId != null) { try { await chrome.windows.remove(winId) } catch (e) {} }
+  }
+}
+
+// Khi extension được cài / cập nhật / reload — re-inject content.js vào mọi tab
+// webapp đang mở để chúng nối lại extension mới (NV không phải tự F5 trang).
+chrome.runtime.onInstalled.addListener(async () => {
+  try {
+    const tabs = await chrome.tabs.query({ url: 'https://vaesa-livechat.pages.dev/*' })
+    for (const t of tabs) {
+      if (!t.id) continue
+      try {
+        await chrome.scripting.executeScript({ target: { tabId: t.id }, files: ['content.js'] })
+      } catch (e) {}
+    }
+  } catch (e) {}
+})
+
 chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   console.log('[VAESA Bridge] msg in:', req?.action)
   const dispatch = async () => {
@@ -1410,6 +1660,8 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
           parsed: extractInboxGlobalId(html, pageId, threadId),
         }
       }
+      case 'VAESA_CRAWL_MBS':
+        return await actionCrawlMbs(req.payload || {})
       default:
         return { ok: false, error: 'Unknown action: ' + req?.action }
     }
