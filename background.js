@@ -1289,9 +1289,10 @@ async function actionSendTextMqtt({ pageId, threadId, body }) {
 
 // ============== TOP-LEVEL ACTIONS ==============
 
-async function actionSendText({ pageId, threadId, threadKey, lastMessageMs, body }) {
+async function actionSendText({ pageId, threadId, threadKey, lastMessageMs, body, globalUid }) {
   // Gửi qua HTTP Mercury (DTSG) — giống hệt Retion (Retion cũng chỉ httpPost, không MQTT).
-  const clientUid = await calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs })
+  // globalUid: webapp truyền sẵn UID thật (conv.customers[0].global_id) → khỏi calcGlobalUid.
+  const clientUid = globalUid || await calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs })
   const sendBody = await buildSendBody({ pageId, clientUid, text: body })
   const { text } = await sendFBMessage(sendBody)
   const parsed = parseFBResponse(text)
@@ -1299,8 +1300,8 @@ async function actionSendText({ pageId, threadId, threadKey, lastMessageMs, body
   return { ok: true, clientUid, payload: parsed.payload }
 }
 
-async function actionSendFile({ pageId, threadId, threadKey, lastMessageMs, body, files }) {
-  const clientUid = await calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs })
+async function actionSendFile({ pageId, threadId, threadKey, lastMessageMs, body, files, globalUid }) {
+  const clientUid = globalUid || await calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs })
 
   // Upload từng file
   const imageIds = []
