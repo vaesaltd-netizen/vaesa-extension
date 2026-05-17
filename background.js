@@ -309,8 +309,11 @@ async function fetchThreadBatch(pageId, beforeMs, limit) {
 }
 
 function extractUidFromThread(t) {
+  // FB từ ~2026-05 trả all_participants rỗng cho thread 1:1 page↔khách.
+  // UID khách lúc đó chỉ còn ở thread_key.other_user_id (góc nhìn av=pageId).
   return t?.all_participants?.nodes?.[0]?.messaging_actor?.id ||
-         t?.all_participants?.edges?.[0]?.node?.messaging_actor?.id
+         t?.all_participants?.edges?.[0]?.node?.messaging_actor?.id ||
+         (t?.thread_key?.other_user_id ? String(t.thread_key.other_user_id) : undefined)
 }
 
 // Trả về thread identifier KHỚP với Pancake.thread_id (15-digit Mercury raw thread fbid).
@@ -391,9 +394,11 @@ function threadToRow(t) {
     : (t?.thread_key?.thread_fbid ? `t_${t.thread_key.thread_fbid}` : null)
   const updatedMs = parseInt(t?.updated_time_precise) || 0
   if (!updatedMs) return null
+  // all_participants có thể rỗng → fallback thread_key.other_user_id (xem extractUidFromThread).
+  const clientUid = actor?.id || t?.thread_key?.other_user_id
   return {
     thread_id: String(threadId),
-    client_uid: actor?.id ? String(actor.id) : null,
+    client_uid: clientUid ? String(clientUid) : null,
     thread_key: threadKey,
     customer_name: actor?.name || null,
     updated_time_ms: updatedMs,
