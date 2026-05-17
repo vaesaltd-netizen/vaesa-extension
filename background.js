@@ -1845,6 +1845,26 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         return { ok: true }
       case 'VAESA_CALC_UID':
         return { ok: true, globalUid: await calcGlobalUid(req.payload || {}) }
+      case 'VAESA_LOOKUP_UID': {
+        // Tra UID đã lưu (cache IDB + D1) — KHÔNG quét Facebook. Dùng lúc mở conv để
+        // khôi phục UID đã quét lần trước → khỏi bấm avatar lại.
+        const { pageId, threadId, psid } = req.payload || {}
+        const keys = [threadId, psid].filter(Boolean).map(String)
+        for (const k of keys) {
+          const c = await getCachedUid(pageId, k)
+          if (c) return { ok: true, globalUid: c }
+        }
+        for (const k of keys) {
+          try {
+            const row = await beGetMeta(pageId, k)
+            if (row?.client_uid) {
+              await setCachedUid(pageId, k, row.client_uid)
+              return { ok: true, globalUid: String(row.client_uid) }
+            }
+          } catch {}
+        }
+        return { ok: true, globalUid: null }
+      }
       case 'VAESA_WARM_UID': {
         // Warm UID khi NV mở hội thoại — light mode (cursor, không paginate).
         // Resolve được → write-through D1 (đã có sẵn trong calcGlobalUid). Fail thì im lặng.
