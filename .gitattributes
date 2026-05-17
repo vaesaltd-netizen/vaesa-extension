@@ -1,0 +1,4 @@
+# Script shell cho macOS — BẮT BUỘC xuống dòng LF, nếu CRLF sẽ lỗi "bad interpreter".
+update.command text eol=lf
+*.command text eol=lf
+*.sh text eol=lf
