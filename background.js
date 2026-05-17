@@ -320,6 +320,20 @@ function extractCommIdFromThread(t) {
   return t?.thread_key?.thread_fbid || t?.page_comm_item?.comm_source_id
 }
 
+// Khớp 1 FB thread với 1 conv Pancake.
+// FB có 2 mã: thread_key.thread_fbid (↔ Pancake thread_id) và
+//             page_comm_item.comm_source_id (↔ Pancake thread_key bỏ 't_').
+// FB từ ~2026-05 trả thread_fbid = null → BẮT BUỘC khớp được qua comm_source_id ↔ thread_key.
+function threadMatchesConv(t, threadId, threadKey) {
+  const fbFbid = t?.thread_key?.thread_fbid
+  const fbComm = t?.page_comm_item?.comm_source_id
+  if (fbFbid && threadId && String(fbFbid) === String(threadId)) return true
+  if (fbComm && threadKey) {
+    if (String(fbComm) === String(threadKey).replace(/^t_/, '')) return true
+  }
+  return false
+}
+
 // ============== VAESA BACKEND HELPERS ==============
 // Gọi Cloudflare Pages Functions /api/fb-uid/* — port logic Retion REQUEST_SERVER
 // nhưng KHÔNG cần Authorization (BE chấp nhận CORS open + dữ liệu không nhạy cảm).
@@ -388,7 +402,7 @@ function threadToRow(t) {
 
 // lightMode=true: bỏ qua bước paginate scan 20 mẻ (~30s). Dùng cho "warm UID khi mở
 // hội thoại" — chỉ làm tới cursor (~1.5s), không quét rộng, tránh spam FB rate-limit.
-async function calcGlobalUid({ pageId, threadId, lastMessageMs, lightMode }) {
+async function calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs, lightMode }) {
   if (!pageId) throw new Error('Thiếu pageId')
   if (!threadId) throw new Error('Thiếu threadId (Pancake conv.thread_id)')
 
@@ -408,6 +422,9 @@ async function calcGlobalUid({ pageId, threadId, lastMessageMs, lightMode }) {
 
   // Nếu BE có timestamp authoritative thì ưu tiên dùng (chính xác hơn Pancake.updated_at).
   const cursorMs = beRow?.updated_time_ms || lastMessageMs
+  // FB mới trả thread_key.thread_fbid = null → cần thread_key Pancake để khớp qua comm_source_id.
+  // Lấy từ tham số truyền vào, fallback thread_key trong D1 (nếu conv đã có trong kho).
+  const convThreadKey = threadKey || beRow?.thread_key || ''
 
   // 3. CURSOR CHÍNH XÁC (port chuẩn Retion 0.2.3.1):
   //    Query `before: cursorMs + 1000, limit: 1` — chỉ chính xác khi cursorMs ≈ FB updated_time
@@ -420,8 +437,7 @@ async function calcGlobalUid({ pageId, threadId, lastMessageMs, lightMode }) {
         const row = threadToRow(t)
         // Lưu thread vừa thấy vào BE để build cache dần — kể cả khi không match
         if (row) bePost('sync', { page_id: pageId, threads: [row] }).catch(() => {})
-        const cs = extractCommIdFromThread(t)
-        if (cs === threadId) {
+        if (threadMatchesConv(t, threadId, convThreadKey)) {
           const uid = extractUidFromThread(t)
           if (uid) {
             await setCachedUid(pageId, threadId, uid)
@@ -429,7 +445,7 @@ async function calcGlobalUid({ pageId, threadId, lastMessageMs, lightMode }) {
             return uid
           }
         } else {
-          console.log(`[VAESA Bridge] cursor không match (cs=${cs} vs ${threadId}) — fallback scan`)
+          console.log(`[VAESA Bridge] cursor không match (fbid=${t?.thread_key?.thread_fbid} comm=${t?.page_comm_item?.comm_source_id} vs threadId=${threadId} threadKey=${convThreadKey}) — fallback scan`)
         }
       }
     } catch (e) {
@@ -442,7 +458,7 @@ async function calcGlobalUid({ pageId, threadId, lastMessageMs, lightMode }) {
 
   // 4. Fallback paginate scan — quét newest ~1000 threads. Mỗi batch đẩy thẳng lên BE
   //    để Phase 1 sync (initial batch) tự build dần khi user gửi tin nhắn thường ngày.
-  const matchFn = (t) => extractCommIdFromThread(t) === threadId
+  const matchFn = (t) => threadMatchesConv(t, threadId, convThreadKey)
 
   let before = Date.now() + 86400000  // +1 day buffer
   const MAX_PAGES = 20  // max scan ~1000 threads (50/batch)
@@ -1251,9 +1267,9 @@ async function actionSendTextMqtt({ pageId, threadId, body }) {
 
 // ============== TOP-LEVEL ACTIONS ==============
 
-async function actionSendText({ pageId, threadId, lastMessageMs, body }) {
+async function actionSendText({ pageId, threadId, threadKey, lastMessageMs, body }) {
   // Gửi qua HTTP Mercury (DTSG) — giống hệt Retion (Retion cũng chỉ httpPost, không MQTT).
-  const clientUid = await calcGlobalUid({ pageId, threadId, lastMessageMs })
+  const clientUid = await calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs })
   const sendBody = await buildSendBody({ pageId, clientUid, text: body })
   const { text } = await sendFBMessage(sendBody)
   const parsed = parseFBResponse(text)
@@ -1261,8 +1277,8 @@ async function actionSendText({ pageId, threadId, lastMessageMs, body }) {
   return { ok: true, clientUid, payload: parsed.payload }
 }
 
-async function actionSendFile({ pageId, threadId, lastMessageMs, body, files }) {
-  const clientUid = await calcGlobalUid({ pageId, threadId, lastMessageMs })
+async function actionSendFile({ pageId, threadId, threadKey, lastMessageMs, body, files }) {
+  const clientUid = await calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs })
 
   // Upload từng file
   const imageIds = []
