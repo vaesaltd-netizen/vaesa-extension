@@ -405,6 +405,19 @@ function threadToRow(t) {
   }
 }
 
+// Ghi UID vừa resolve vào D1 ĐÚNG theo threadId Pancake — khoá mà chip + gửi tin tra cứu.
+// BẮT BUỘC ghi riêng: threadToRow khoá row theo comm_source_id (≠ Pancake thread_id) nên
+// row nó đẩy lên không bao giờ update được row Pancake → UID resolve xong mà D1 vẫn rỗng.
+function beSaveResolvedUid(pageId, threadId, threadKey, uid, updatedMs) {
+  bePost('sync', { page_id: pageId, threads: [{
+    thread_id: String(threadId),
+    client_uid: String(uid),
+    thread_key: threadKey || null,
+    customer_name: null,
+    updated_time_ms: updatedMs || 1,
+  }] }).catch(() => {})
+}
+
 // lightMode=true: bỏ qua bước paginate scan 20 mẻ (~30s). Dùng cho "warm UID khi mở
 // hội thoại" — chỉ làm tới cursor (~1.5s), không quét rộng, tránh spam FB rate-limit.
 async function calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs, lightMode }) {
@@ -446,6 +459,7 @@ async function calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs, light
           const uid = extractUidFromThread(t)
           if (uid) {
             await setCachedUid(pageId, threadId, uid)
+            beSaveResolvedUid(pageId, threadId, convThreadKey, uid, cursorMs)
             console.log(`[VAESA Bridge] calcUid OK (cursor): page=${pageId} thread=${threadId} → ${uid} (1 query)`)
             return uid
           }
@@ -494,6 +508,9 @@ async function calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs, light
     if (target) {
       const globalUid = extractUidFromThread(target)
       if (!globalUid) throw new Error('FB thread không có messaging_actor.id')
+      await setCachedUid(pageId, threadId, globalUid)
+      beSaveResolvedUid(pageId, threadId, convThreadKey, globalUid,
+        parseInt(target?.updated_time_precise) || cursorMs)
       console.log(`[VAESA Bridge] calcUid OK (scan): page=${pageId} thread=${threadId} → ${globalUid} (sau ${i + 1} batches, ${totalScanned} threads)`)
       return globalUid
     }
