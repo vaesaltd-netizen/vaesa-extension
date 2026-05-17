@@ -1136,6 +1136,172 @@ async function uploadOneFile({ pageId, fileBase64, fileMime, fileName }) {
   return imageId
 }
 
+// ============== GỬI TIN KIỂU PANCAKE (port sendInbox / buildSendParams) ==============
+// Port nguyên cơ chế gửi của Pancake (extension 0.5.45, class InboxNormal):
+//   - Quét "ctx phiên" FB từ trang inbox (Base.ctxFromHtml) → cache 1h (lastLoadHtmlAt).
+//   - buildSendParams: body Mercury ĐẦY ĐỦ tham số phiên (buildParams).
+//   - POST business.facebook.com/messaging/send/ (có dấu / cuối — đúng Pancake).
+// Đường này ưu tiên; lỗi → fallback đường Mercury tối giản cũ (vẫn chạy tốt).
+
+const PC_CTX_TTL_MS = 60 * 60 * 1000   // 1h — giống Pancake (base.lastLoadHtmlAt)
+const _pcCtxCache = {}                 // pageId → { ctx, ts }
+let _pcReqCount = 50                   // giống Base.request_count khởi tạo 50
+
+// Port Base.ctxFromHtml — quét tham số phiên từ HTML trang inbox (regex, không cần offscreen
+// eval: SiteData FB render ra JSON hợp lệ → JSON.parse được).
+function pcParseCtx(html) {
+  const ctx = {}
+  const g = (re) => html.match(re)?.[1]
+  ctx.userID = g(/\\?"USER_ID\\?":\\?"(\d+)\\?"/i) || g(/"ACCOUNT_ID"\s*:\s*"(\d+)"/)
+  ctx.dtsg = g(/"DTSGInitData",\[\],\{"token":"([^"]+)"/) ||
+             g(/"DTSGInitialData",\[\],\{"token":"([^"]+)"/) ||
+             g(/name="fb_dtsg" value="([^"]+)"/)
+  ctx.lsd = g(/"LSD",\[\],\{"token":"([^"]+)"/) || g(/name="lsd" value="([^"]+)"/)
+  ctx.client_revision = g(/"client_revision":(\d+)/)
+  // SprinkleConfig — quyết định cách tính jazoest
+  const sp = html.match(/"SprinkleConfig",\[\],\{"param_name":"([^"]+)","version":(\d+),"should_randomize":(true|false)\}/)
+  ctx.sprinkle = sp
+    ? { param_name: sp[1], version: parseInt(sp[2]), should_randomize: sp[3] === 'true' }
+    : { param_name: 'jazoest', version: 2, should_randomize: false }
+  // SiteData — object cấu hình phiên (rev, hsi, spin...). Cắt khối {...} cân ngoặc rồi JSON.parse.
+  const sdMark = html.indexOf('"SiteData",[],')
+  if (sdMark > -1) {
+    const brace = html.indexOf('{', sdMark)
+    if (brace > -1) {
+      const objStr = extractBalancedJson(html, brace)
+      if (objStr) { try { ctx.SiteData = JSON.parse(objStr) } catch {} }
+    }
+  }
+  return ctx
+}
+
+// Port Base.calcJazoest / calcJazoestV2.
+function pcCalcJazoest(dtsg, sprinkle) {
+  let sum = 0
+  for (let i = 0; i < dtsg.length; i++) sum += dtsg.charCodeAt(i)
+  if (sprinkle.version === 2) return sprinkle.should_randomize ? String(sum) : '2' + sum
+  let s = ''
+  for (let i = 0; i < dtsg.length; i++) s += dtsg.charCodeAt(i)
+  return '2' + s
+}
+
+// Port Base.buildParams — tham số phiên gắn vào mọi request.
+function pcBuildParams(ctx) {
+  const t = { __user: ctx.userID || '0', __a: 1, __req: (_pcReqCount++).toString(36) }
+  const sd = ctx.SiteData
+  if (sd) {
+    t.__csr = ''
+    t.__beoa = sd.be_one_ahead ? 1 : 0
+    if (sd.pkg_cohort != null) t.__pc = sd.pkg_cohort
+    if (sd.pr != null) t.dpr = sd.pr
+    t.__rev = sd.client_revision
+    if (sd.hsi != null) t.__hsi = sd.hsi
+    if (sd.haste_session != null) t.__hs = sd.haste_session
+    t.__comet_req = sd.is_comet ? 1 : 0
+    if (sd.spin) {
+      t.__spin_r = sd.__spin_r
+      t.__spin_b = sd.__spin_b
+      t.__spin_t = sd.__spin_t
+    }
+  }
+  if (!t.__rev && ctx.client_revision) t.__rev = ctx.client_revision
+  if (ctx.dtsg) {
+    t.fb_dtsg = ctx.dtsg
+    t[ctx.sprinkle.param_name] = pcCalcJazoest(ctx.dtsg, ctx.sprinkle)
+  }
+  if (ctx.lsd) t.lsd = ctx.lsd
+  return t
+}
+
+// Port Z.generateOfflineThreadingID + h().
+function pcH(e) {
+  let t = ''
+  while (e !== '0') {
+    let a = 0, s = ''
+    for (let r = 0; r < e.length; r++) {
+      a = a * 2 + parseInt(e[r], 10)
+      if (a >= 10) { s += '1'; a -= 10 } else { s += '0' }
+    }
+    t = a.toString() + t
+    e = s.slice(s.indexOf('1'))
+  }
+  return t
+}
+function pcOfflineThreadingID() {
+  let e = Date.now()
+  let t = Math.floor(Math.random() * 4294967296)
+  t = ('0000000000000000000000' + t.toString(2)).slice(-22)
+  e = e.toString(2) + t
+  return pcH(e.slice(-63))
+}
+
+// Port InboxNormal.buildSendParams (nhánh facebook).
+function pcBuildSendParams({ pageId, globalUid, text, imageIds, ctx }) {
+  const otid = pcOfflineThreadingID()
+  let u = {
+    body: text || '',
+    offline_threading_id: otid,
+    source: 'source:page_unified_inbox',
+    timestamp: Date.now(),
+    request_user_id: pageId,
+  }
+  u = Object.assign(u, pcBuildParams(ctx), { __usid: null })
+  u['specific_to_list[0]'] = 'fbid:' + globalUid
+  u['specific_to_list[1]'] = 'fbid:' + pageId
+  u.other_user_fbid = globalUid
+  u.message_id = otid
+  u.client = 'mercury'
+  u.action_type = 'ma-type:user-generated-message'
+  u.ephemeral_ttl_mode = 0
+  u.has_attachment = !!(imageIds && imageIds.length)
+  if (imageIds && imageIds.length) {
+    imageIds.forEach((id, i) => { u['image_ids[' + i + ']'] = id })
+  }
+  return u
+}
+
+// Lấy ctx phiên cho page — cache 1h. force=true bỏ cache (warm/refresh).
+async function pcGetCtx(pageId, force) {
+  const c = _pcCtxCache[pageId]
+  if (!force && c && Date.now() - c.ts < PC_CTX_TTL_MS) return c.ctx
+  const url = `https://business.facebook.com/latest/inbox/messenger?asset_id=${encodeURIComponent(pageId)}`
+  const res = await fetch(url, {
+    credentials: 'include',
+    headers: { accept: 'text/html,*/*', 'accept-language': 'en-US,en;q=0.9' },
+  })
+  if (!res.ok) throw new Error('Tải trang inbox lỗi HTTP ' + res.status)
+  const ctx = pcParseCtx(await res.text())
+  if (!ctx.dtsg) throw new Error('Không quét được fb_dtsg từ trang inbox')
+  ctx.refererUrl = url
+  _pcCtxCache[pageId] = { ctx, ts: Date.now() }
+  console.log(`[VAESA Bridge] pcGetCtx OK page=${pageId} (dtsg+SiteData${ctx.SiteData ? '✓' : '✗'})`)
+  return ctx
+}
+
+// Gửi 1 tin kiểu Pancake — POST business.facebook.com/messaging/send/.
+async function sendViaPancake({ pageId, globalUid, text, imageIds }) {
+  if (!globalUid) throw new Error('sendViaPancake: thiếu UID khách')
+  const ctx = await pcGetCtx(pageId)
+  const params = pcBuildSendParams({ pageId, globalUid, text, imageIds, ctx })
+  const body = Object.keys(params)
+    .map(k => encodeURIComponent(k) + '=' + encodeURIComponent(params[k]))
+    .join('&')
+  const res = await fetch('https://business.facebook.com/messaging/send/', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body,
+  })
+  const txt = await res.text()
+  const parsed = parseFBResponse(txt)
+  if (!parsed.ok) {
+    // ctx có thể hết hạn (dtsg xoay) → bust cache để lần sau quét lại.
+    if (/dtsg|csrf|1357\d{3}|login/i.test(parsed.error || '')) delete _pcCtxCache[pageId]
+    throw new Error(parsed.error || 'Pancake send fail (HTTP ' + res.status + ')')
+  }
+  return parsed
+}
+
 // ============== MQTT TIER 2 (FB WebSocket) ==============
 // Port từ Retion injectedWs.js. Adapted cho SW (self.WebSocket thay window).
 // Trigger: HTTP Mercury fail với error_code 1545041 ("Người này không có mặt").
@@ -1429,19 +1595,25 @@ async function actionSendTextMqtt({ pageId, threadId, body }) {
 
 // ============== TOP-LEVEL ACTIONS ==============
 
-async function actionSendText({ pageId, threadId, threadKey, lastMessageMs, body, globalUid }) {
-  // Gửi qua HTTP Mercury (DTSG) — giống hệt Retion (Retion cũng chỉ httpPost, không MQTT).
-  // globalUid: webapp truyền sẵn UID thật (conv.customers[0].global_id) → khỏi calcGlobalUid.
-  const clientUid = globalUid || await calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs })
+async function actionSendText({ pageId, threadId, threadKey, lastMessageMs, body, globalUid, customerName }) {
+  const clientUid = globalUid || await calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs, customerName })
+  // Đường Pancake (port sendInbox) — ưu tiên.
+  try {
+    const r = await sendViaPancake({ pageId, globalUid: clientUid, text: body })
+    return { ok: true, clientUid, payload: r.payload, via: 'pancake' }
+  } catch (e) {
+    console.warn('[VAESA Bridge] Pancake send fail, fallback Mercury cũ:', e?.message || e)
+  }
+  // Fallback: Mercury tối giản cũ (vẫn chạy tốt).
   const sendBody = await buildSendBody({ pageId, clientUid, text: body })
   const { text } = await sendFBMessage(sendBody)
   const parsed = parseFBResponse(text)
   if (!parsed.ok) throw new Error(parsed.error || 'Gửi thất bại')
-  return { ok: true, clientUid, payload: parsed.payload }
+  return { ok: true, clientUid, payload: parsed.payload, via: 'mercury' }
 }
 
-async function actionSendFile({ pageId, threadId, threadKey, lastMessageMs, body, files, globalUid }) {
-  const clientUid = globalUid || await calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs })
+async function actionSendFile({ pageId, threadId, threadKey, lastMessageMs, body, files, globalUid, customerName }) {
+  const clientUid = globalUid || await calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs, customerName })
 
   // Upload từng file
   const imageIds = []
@@ -1460,11 +1632,19 @@ async function actionSendFile({ pageId, threadId, threadKey, lastMessageMs, body
   }
   if (!imageIds.length) throw new Error('Không upload được file nào')
 
+  // Đường Pancake — ưu tiên.
+  try {
+    const r = await sendViaPancake({ pageId, globalUid: clientUid, text: body, imageIds })
+    return { ok: true, clientUid, imageIds, payload: r.payload, via: 'pancake' }
+  } catch (e) {
+    console.warn('[VAESA Bridge] Pancake send (file) fail, fallback Mercury cũ:', e?.message || e)
+  }
+  // Fallback: Mercury tối giản cũ.
   const sendBody = await buildSendBody({ pageId, clientUid, text: body, imageIds })
   const { text } = await sendFBMessage(sendBody)
   const parsed = parseFBResponse(text)
   if (!parsed.ok) throw new Error(parsed.error || 'Gửi thất bại')
-  return { ok: true, clientUid, imageIds, payload: parsed.payload }
+  return { ok: true, clientUid, imageIds, payload: parsed.payload, via: 'mercury' }
 }
 
 async function actionStatus() {
@@ -1751,8 +1931,11 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
       case 'VAESA_WARM_UID': {
         // Warm UID khi NV mở hội thoại — light mode (cursor, không paginate).
         // Resolve được → write-through D1 (đã có sẵn trong calcGlobalUid). Fail thì im lặng.
+        // Đồng thời warm ctx phiên Pancake (fire-and-forget) → lúc gửi tức thì.
+        const wp = req.payload || {}
+        if (wp.pageId) pcGetCtx(String(wp.pageId)).catch(() => {})
         try {
-          const uid = await calcGlobalUid({ ...(req.payload || {}), lightMode: true })
+          const uid = await calcGlobalUid({ ...wp, lightMode: true })
           return { ok: true, globalUid: uid, warmed: true }
         } catch (e) {
           return { ok: true, warmed: false, reason: String(e?.message || e) }
@@ -1823,6 +2006,22 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
           beSaveResolvedUid(pageId, cacheKey, threadKey || null, uid, convUpdatedMs || Date.now())
         }
         return { ok: true, globalUid: uid }
+      }
+      case 'VAESA_DEBUG_PC_CTX': {
+        // Debug — quét ctx phiên Pancake, trả tóm tắt (không gửi gì).
+        const { pageId } = req.payload || {}
+        const ctx = await pcGetCtx(String(pageId), true)
+        const sd = ctx.SiteData || {}
+        const params = pcBuildSendParams({ pageId: String(pageId), globalUid: '100000000000000', text: 'x', ctx })
+        return {
+          ok: true,
+          hasDtsg: !!ctx.dtsg, hasLsd: !!ctx.lsd, userID: ctx.userID || null,
+          hasSiteData: !!ctx.SiteData,
+          siteDataKeys: Object.keys(sd).slice(0, 30),
+          sprinkle: ctx.sprinkle,
+          jazoest: ctx.dtsg ? pcCalcJazoest(ctx.dtsg, ctx.sprinkle) : null,
+          sendParamKeys: Object.keys(params),
+        }
       }
       case 'VAESA_DEBUG_THREADLIST': {
         // Debug Phase 2 — threadlist fetch với FULL query_params kiểu Pancake findThread.
