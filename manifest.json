@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "VAESA Extension",
-  "version": "3.8.6",
+  "version": "3.9.0",
   "description": "Cầu nối VAESA Livechat — gửi tin Facebook không giới hạn 24h.",
 
   "icons": {
@@ -31,6 +31,7 @@
     "https://upload-business.facebook.com/*",
     "https://m.facebook.com/*",
     "https://www.facebook.com/*",
+    "https://*.fbcdn.net/*",
     "wss://edge-chat.facebook.com/*"
   ],
 

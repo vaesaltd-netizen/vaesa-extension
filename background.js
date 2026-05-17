@@ -472,8 +472,23 @@ async function calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs, light
     }
   }
 
-  // lightMode: dừng ở đây (chỉ cursor). Warm-on-open không quét rộng.
-  if (lightMode) throw new Error('lightMode: cursor không resolve được, bỏ qua paginate scan')
+  // 3b. FALLBACK TRỰC TIẾP (Phase 2) — hỏi UID thẳng theo threadId qua
+  //     PagesManagerInboxAdminAssignerRootQuery. Với tới conv CŨ bất kỳ, không
+  //     vướng giới hạn 334 của cursor scan. Đáng tin hơn scan nên thử trước.
+  try {
+    const uid = await resolveUidDirect(pageId, threadId)
+    if (uid) {
+      await setCachedUid(pageId, threadId, uid)
+      beSaveResolvedUid(pageId, threadId, convThreadKey, uid, cursorMs || Date.now())
+      console.log(`[VAESA Bridge] calcUid OK (direct query): page=${pageId} thread=${threadId} → ${uid}`)
+      return uid
+    }
+  } catch (e) {
+    console.warn('[VAESA Bridge] resolveUidDirect fail, fallback scan:', e?.message || e)
+  }
+
+  // lightMode: dừng ở đây (cursor + direct). Warm-on-open không quét rộng.
+  if (lightMode) throw new Error('lightMode: cursor + direct không resolve được, bỏ qua paginate scan')
 
   // 4. Fallback paginate scan — quét newest ~1000 threads. Mỗi batch đẩy thẳng lên BE
   //    để Phase 1 sync (initial batch) tự build dần khi user gửi tin nhắn thường ngày.
@@ -752,11 +767,170 @@ async function resolveCommentGlobalId({ postId, commentId }) {
   throw new Error(`Không tìm thấy bình luận ${commentShort} trong post (KH có thể đã xoá comment)`)
 }
 
+// ============== PHASE 2: DIRECT UID RESOLVER ==============
+// Port từ Pancake (bản 0.5.45) class `ge` → getGlobalIdFromInbox bước 1:
+// query `PagesManagerInboxAdminAssignerRootQuery` hỏi UID THẲNG theo threadId.
+//   graphql({ pageID, commItemID: threadId }) → data.commItem.target_id = UID khách.
+// Với tới conv CŨ bất kỳ — KHÔNG vướng giới hạn 334 của messenger threadlist
+// (cursor scan chỉ quét được ~1000 thread mới nhất).
+//
+// Cần 2 mảnh: (1) doc_id của query — cào từ JS bundle FB, cache 5h;
+//             (2) gọi GraphQL — params tối thiểu, copy y flow mbsSearchUid đã verify.
+// KHÔNG cần buildParams đầy đủ (jazoest/__usid/__rev...): endpoint /api/graphql/
+// với fb_api_req_friendly_name chỉ cần av + fb_dtsg + lsd (xem mbsSearchUid).
+
+const INBOX_QUERY_NAME = 'PagesManagerInboxAdminAssignerRootQuery'
+const DOCID_CACHE_TTL_MS = 5 * 60 * 60 * 1000   // 5h — giống DocIdResolver Pancake
+const DOCID_STORAGE_KEY = 'vaesa_inbox_docid'
+let _docIdCache = null   // { docId, ts }
+
+async function _fetchInboxViewHtml(pageId) {
+  const url = `https://business.facebook.com/latest/inbox/messenger?asset_id=${encodeURIComponent(pageId)}&thread_type=FB_MESSAGE`
+  const res = await fetch(url, {
+    credentials: 'include',
+    headers: {
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'accept-language': 'en-US,en;q=0.9',
+    },
+  })
+  if (!res.ok) throw new Error('FB inbox view HTTP ' + res.status)
+  return await res.text()
+}
+
+// Trích URL JS bundle (static.*.fbcdn.net/rsrc.php/...js) khỏi HTML inbox.
+// Ưu tiên bundle nạp ngay qua <script src> (chứa core inbox, ~22 file) RỒI MỚI
+// tới bundle trong resource_map (lazy). doc_id của query inbox gần như luôn nằm
+// trong nhóm eager → quét nhóm này trước cho nhanh.
+function _extractJsBundleUrls(html) {
+  const flat = html.replace(/\\\//g, '/')
+  const isJs = (u) => /\.js(\?|$)/.test(u)
+  const eager = []
+  for (const m of flat.matchAll(/<script[^>]+src="(https:\/\/[a-z0-9.-]*fbcdn\.net\/rsrc\.php\/[^"]+)"/g)) {
+    if (isJs(m[1]) && !eager.includes(m[1])) eager.push(m[1])
+  }
+  const out = [...eager]
+  for (const m of flat.matchAll(/https:\/\/[a-z0-9.-]*fbcdn\.net\/rsrc\.php\/[^\s"'\\)]+/g)) {
+    if (isJs(m[0]) && !out.includes(m[0])) out.push(m[0])
+  }
+  return out
+}
+
+// Regex doc_id trong 1 file JS — port verbatim các mẫu của DocIdResolver.loadResource.
+function _extractDocIdFromJs(js, queryName) {
+  const pats = [
+    new RegExp('__d\\("' + queryName + '_facebookRelayOperation"[\\s\\S]+?exports="(\\d+)"'),
+    new RegExp('__d\\("' + queryName + '_instagramRelayOperation"[\\s\\S]+?exports="(\\d+)"'),
+    new RegExp('__d\\("' + queryName + '"[\\s\\S]+?__getDocID=function\\(\\)\\{return"(\\d+)"'),
+    new RegExp('operationKind:"[^"]+",name:"' + queryName + '",id:"(\\d+)"'),
+    new RegExp('id:"(\\d+)",(?:[^:]+:.+?,)?name:"' + queryName + '"'),
+  ]
+  for (const re of pats) {
+    const m = js.match(re)
+    if (m) return m[1]
+  }
+  return null
+}
+
+// Cào doc_id: tải HTML inbox → liệt kê JS bundle → tải từng mẻ 6 file, regex,
+// dừng ngay khi thấy. (Pancake làm y vậy trong loadResources.)
+async function _harvestInboxDocId(pageId) {
+  const html = await _fetchInboxViewHtml(pageId)
+  const inline = _extractDocIdFromJs(html, INBOX_QUERY_NAME)
+  if (inline) return inline
+  const bundles = _extractJsBundleUrls(html).slice(0, 40)
+  if (!bundles.length) throw new Error('Không tìm thấy JS bundle nào trong HTML inbox')
+  for (let i = 0; i < bundles.length; i += 6) {
+    const batch = bundles.slice(i, i + 6)
+    const found = await Promise.all(batch.map(async (url) => {
+      try {
+        const r = await fetch(url, { credentials: 'omit' })
+        if (!r.ok) return null
+        return _extractDocIdFromJs(await r.text(), INBOX_QUERY_NAME)
+      } catch { return null }
+    }))
+    const hit = found.find(Boolean)
+    if (hit) return hit
+  }
+  throw new Error(`Không cào được doc_id ${INBOX_QUERY_NAME} (đã quét ${bundles.length} bundle JS)`)
+}
+
+async function getInboxDocId(pageId) {
+  if (_docIdCache && Date.now() - _docIdCache.ts < DOCID_CACHE_TTL_MS) return _docIdCache.docId
+  if (!_docIdCache) {
+    try {
+      const st = await chrome.storage.local.get(DOCID_STORAGE_KEY)
+      const c = st[DOCID_STORAGE_KEY]
+      if (c?.docId && Date.now() - c.ts < DOCID_CACHE_TTL_MS) {
+        _docIdCache = c
+        return c.docId
+      }
+    } catch {}
+  }
+  const docId = await _harvestInboxDocId(pageId)
+  _docIdCache = { docId, ts: Date.now() }
+  try { await chrome.storage.local.set({ [DOCID_STORAGE_KEY]: _docIdCache }) } catch {}
+  console.log(`[VAESA Bridge] cào doc_id ${INBOX_QUERY_NAME} = ${docId}`)
+  return docId
+}
+
+function _bustDocIdCache() {
+  _docIdCache = null
+  chrome.storage.local.remove(DOCID_STORAGE_KEY).catch(() => {})
+}
+
+// dtsg cached 30 phút (getDtsg); lsd lấy từ _fbUser nếu có, không thì mbsFetchTokens
+// (business/home — đã verify có cả dtsg+lsd).
+async function _getGraphqlTokens() {
+  const dtsg = await getDtsg()
+  if (_fbUser.lsd) return { dtsg, lsd: _fbUser.lsd }
+  return await mbsFetchTokens()
+}
+
+// Hỏi UID khách THẲNG theo threadId. Trả UID (string) hoặc throw.
+async function resolveUidDirect(pageId, threadId) {
+  if (!pageId || !threadId) throw new Error('resolveUidDirect: thiếu pageId/threadId')
+  const docId = await getInboxDocId(pageId)
+  const { dtsg, lsd } = await _getGraphqlTokens()
+  const body = new URLSearchParams()
+  body.set('av', String(pageId))            // act-as-page — BẮT BUỘC
+  body.set('fb_dtsg', dtsg)
+  body.set('lsd', lsd)
+  body.set('fb_api_caller_class', 'RelayModern')
+  body.set('fb_api_req_friendly_name', INBOX_QUERY_NAME)
+  body.set('variables', JSON.stringify({
+    pageID: String(pageId),
+    commItemID: String(threadId),
+  }))
+  body.set('doc_id', docId)
+  const res = await fetch('https://business.facebook.com/api/graphql/', {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+      'x-fb-friendly-name': INBOX_QUERY_NAME,
+      'x-fb-lsd': lsd,
+      'x-asbd-id': '359341',
+    },
+    body: body.toString(),
+  })
+  const txt = await res.text()
+  let data
+  try {
+    data = JSON.parse(txt.replace(/^for ?\(;;\);/, ''))
+  } catch {
+    throw new Error('resolveUidDirect: GraphQL trả về không phải JSON (HTTP ' + res.status + ')')
+  }
+  const tid = data?.data?.commItem?.target_id
+  if (tid && String(tid) !== String(pageId)) return String(tid)
+  // Lỗi → doc_id có thể đã hết hạn (FB xoay liên tục). Bust cache trừ khi rate-limit.
+  const err = data?.errors?.[0]
+  if (err && err.message !== 'Rate limit exceeded') _bustDocIdCache()
+  throw new Error('resolveUidDirect: không có target_id' + (err ? ' — ' + err.message : ''))
+}
+
 // ============== INBOX GLOBAL ID RESOLVER (Phase 1C — inbox) ==============
-// Port từ Pancake: ép FB materialize thread qua business inbox URL → parse HTML.
-// URL: business.facebook.com/latest/inbox/all?asset_id={pageId}&selected_item_id={threadId}
-// → FB nạp chi tiết participant → HTML chứa other_user_id / entity_id / messaging_actor.
-// KHÔNG vướng giới hạn 334 (mở thẳng 1 thread cụ thể).
+// Phần fetchInboxHtml/extractInboxGlobalId giữ lại cho debug (VAESA_DEBUG_INBOX_HTML).
+// Cách resolve THẬT: resolveUidDirect ở trên (GraphQL trực tiếp, đáng tin).
 
 async function fetchInboxHtml(pageId, threadId) {
   const url = `https://business.facebook.com/latest/inbox/all?asset_id=${pageId}&selected_item_id=${threadId}`
@@ -799,12 +973,9 @@ function extractInboxGlobalId(html, pageId, threadId) {
 }
 
 async function resolveInboxGlobalId({ pageId, threadId }) {
-  // TẠM VÔ HIỆU HÓA: parse HTML inbox không đáng tin cậy — fetch thô chỉ trả
-  // bootstrap HTML (sidebar), thread cũ chưa materialize → extractInboxGlobalId
-  // đoán theo "id xuất hiện nhiều nhất" → CÓ THỂ TRẢ NHẦM người khác.
-  // Ghi UID sai = gửi tin nhầm khách. Chặn lại tới khi có cơ chế chuẩn.
-  // (Giữ fetchInboxHtml/extractInboxGlobalId cho việc nghiên cứu sau.)
-  throw new Error('resolveInboxGlobalId: chưa có cơ chế resolve đáng tin cậy cho inbox cũ')
+  // Phase 2: hỏi UID thẳng theo threadId qua PagesManagerInboxAdminAssignerRootQuery.
+  // Đáng tin (FB trả đúng target_id của thread), với tới conv cũ bất kỳ.
+  return await resolveUidDirect(pageId, threadId)
 }
 
 // ============== PHASE 1C — resolve hàng loạt conv comment thiếu UID ==============
@@ -1671,6 +1842,11 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
       case 'VAESA_RESOLVE_ONE_COMMENT':
         // Resolve 1 conv comment on-demand, trả UID ngay.
         return { ok: true, globalUid: await resolveCommentGlobalId(req.payload || {}) }
+      case 'VAESA_RESOLVE_ONE_INBOX': {
+        // Resolve 1 conv inbox CŨ on-demand (Phase 2 — query trực tiếp theo threadId).
+        const { pageId, threadId } = req.payload || {}
+        return { ok: true, globalUid: await resolveUidDirect(pageId, threadId) }
+      }
       case 'VAESA_GET_SYNC_STATE':
         return await beGet('sync-state', { page_id: req.payload?.pageId || '' })
       case 'VAESA_RELOAD_SELF':
