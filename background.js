@@ -418,128 +418,45 @@ function beSaveResolvedUid(pageId, threadId, threadKey, uid, updatedMs) {
   }] }).catch(() => {})
 }
 
-// lightMode=true: bỏ qua bước paginate scan 20 mẻ (~30s). Dùng cho "warm UID khi mở
-// hội thoại" — chỉ làm tới cursor (~1.5s), không quét rộng, tránh spam FB rate-limit.
-async function calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs, lightMode, customerName }) {
+// Lấy UID khách — MỘT đường sạch (đúng cơ chế Pancake):
+//   1. Cache IDB — đã quét trước đó.
+//   2. D1 — kho lưu UID đã quét (conv Pancake không cấp sẵn UID → bấm avatar quét → lưu D1).
+//   3. resolveUidByName — quét threadlist kiểu Pancake (ge.findThread): khớp threadId/tên,
+//      cascade INBOX→ARCHIVED. Quét được → lưu D1 + cache cho lần sau.
+// Đã BỎ: cursor-query + paginate-scan params-tối-giản (code cũ thời Retion — FB trả
+// thiếu all_participants nên hay sai). Pancake chỉ có findThread, không có 2 thứ kia.
+async function calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs, customerName }) {
   if (!pageId) throw new Error('Thiếu pageId')
-  if (!threadId) throw new Error('Thiếu threadId (Pancake conv.thread_id)')
+  if (!threadId && !customerName) throw new Error('Thiếu threadId/customerName')
 
-  // 1. Local IDB cache check (fastest path)
-  const cached = await getCachedUid(pageId, threadId)
-  if (cached) return cached
-
-  // 2. BE D1 lookup — authoritative store. Có thể trả về luôn UID, hoặc chỉ trả về
-  //    updated_time_ms để cursor precise FB không lệch.
-  const beRow = await beGetMeta(pageId, threadId)
-  if (beRow?.client_uid) {
-    // Có sẵn UID trên BE → done, cache lại IDB cho lần sau
-    await setCachedUid(pageId, threadId, beRow.client_uid)
-    console.log(`[VAESA Bridge] calcUid OK (BE D1): page=${pageId} thread=${threadId} → ${beRow.client_uid}`)
-    return beRow.client_uid
+  // 1. Cache IDB
+  if (threadId) {
+    const cached = await getCachedUid(pageId, threadId)
+    if (cached) return cached
   }
 
-  // Nếu BE có timestamp authoritative thì ưu tiên dùng (chính xác hơn Pancake.updated_at).
-  const cursorMs = beRow?.updated_time_ms || lastMessageMs
-  // FB mới trả thread_key.thread_fbid = null → cần thread_key Pancake để khớp qua comm_source_id.
-  // Lấy từ tham số truyền vào, fallback thread_key trong D1 (nếu conv đã có trong kho).
-  const convThreadKey = threadKey || beRow?.thread_key || ''
-
-  // 3. CURSOR CHÍNH XÁC (port chuẩn Retion 0.2.3.1):
-  //    Query `before: cursorMs + 1000, limit: 1` — chỉ chính xác khi cursorMs ≈ FB updated_time
-  //    của đúng thread cần tìm. BE D1 (Phase 1 sync) đảm bảo điều này.
-  if (cursorMs && Number.isFinite(cursorMs) && cursorMs > 0) {
-    try {
-      const { threads } = await fetchThreadBatch(pageId, cursorMs + 1000, 1)
-      if (threads.length === 1) {
-        const t = threads[0]
-        const row = threadToRow(t)
-        // Lưu thread vừa thấy vào BE để build cache dần — kể cả khi không match
-        if (row) bePost('sync', { page_id: pageId, threads: [row] }).catch(() => {})
-        if (threadMatchesConv(t, threadId, convThreadKey)) {
-          const uid = extractUidFromThread(t)
-          if (uid) {
-            await setCachedUid(pageId, threadId, uid)
-            beSaveResolvedUid(pageId, threadId, convThreadKey, uid, cursorMs)
-            console.log(`[VAESA Bridge] calcUid OK (cursor): page=${pageId} thread=${threadId} → ${uid} (1 query)`)
-            return uid
-          }
-        } else {
-          console.log(`[VAESA Bridge] cursor không match (fbid=${t?.thread_key?.thread_fbid} comm=${t?.page_comm_item?.comm_source_id} vs threadId=${threadId} threadKey=${convThreadKey}) — fallback scan`)
-        }
-      }
-    } catch (e) {
-      console.warn('[VAESA Bridge] cursor query fail, fallback scan:', e?.message || e)
+  // 2. D1 — kho UID đã quét
+  let convThreadKey = threadKey || ''
+  if (threadId) {
+    const beRow = await beGetMeta(pageId, threadId)
+    if (beRow?.client_uid) {
+      await setCachedUid(pageId, threadId, beRow.client_uid)
+      console.log(`[VAESA Bridge] UID OK (D1): page=${pageId} thread=${threadId} → ${beRow.client_uid}`)
+      return beRow.client_uid
     }
+    convThreadKey = convThreadKey || beRow?.thread_key || ''
   }
 
-  // 3b. FALLBACK quét threadlist khớp TÊN (Phase 2 — port Pancake findThread).
-  //     Cascade tag INBOX → ARCHIVED → ... — với tới conv cũ (ngoài cap 334 của
-  //     cursor scan thường, vì conv cũ nằm ở tag ARCHIVED). Cần customerName.
-  if (customerName) {
-    try {
-      const uid = await resolveUidByName({
-        pageId, customerName, threadId, threadKey: convThreadKey,
-        convUpdatedMs: cursorMs || lastMessageMs,
-      })
-      if (uid) {
-        await setCachedUid(pageId, threadId, uid)
-        beSaveResolvedUid(pageId, threadId, convThreadKey, uid, cursorMs || Date.now())
-        console.log(`[VAESA Bridge] calcUid OK (findThread): page=${pageId} thread=${threadId} → ${uid}`)
-        return uid
-      }
-    } catch (e) {
-      console.warn('[VAESA Bridge] resolveUidByName fail, fallback scan:', e?.message || e)
-    }
-  }
-
-  // lightMode: dừng ở đây (cursor + findThread). Warm-on-open không quét rộng.
-  if (lightMode) throw new Error('lightMode: cursor + findThread không resolve được, bỏ qua paginate scan')
-
-  // 4. Fallback paginate scan — quét newest ~1000 threads. Mỗi batch đẩy thẳng lên BE
-  //    để Phase 1 sync (initial batch) tự build dần khi user gửi tin nhắn thường ngày.
-  const matchFn = (t) => threadMatchesConv(t, threadId, convThreadKey)
-
-  let before = Date.now() + 86400000  // +1 day buffer
-  const MAX_PAGES = 20  // max scan ~1000 threads (50/batch)
-  const BATCH_SIZE = 50
-  const seenCommIds = new Set()
-  let totalScanned = 0
-
-  for (let i = 0; i < MAX_PAGES; i++) {
-    const { threads, oldestTime } = await fetchThreadBatch(pageId, before, BATCH_SIZE)
-    if (!threads.length) break
-    totalScanned += threads.length
-
-    // Build cache IDB + đẩy BE cho TẤT CẢ threads scan được
-    const beRows = []
-    for (const t of threads) {
-      const cs = extractCommIdFromThread(t)
-      const uid = extractUidFromThread(t)
-      if (cs && uid && !seenCommIds.has(cs)) {
-        seenCommIds.add(cs)
-        await setCachedUid(pageId, cs, uid)
-      }
-      const row = threadToRow(t)
-      if (row) beRows.push(row)
-    }
-    if (beRows.length) bePost('sync', { page_id: pageId, threads: beRows }).catch(() => {})
-
-    const target = threads.find(matchFn)
-    if (target) {
-      const globalUid = extractUidFromThread(target)
-      if (!globalUid) throw new Error('FB thread không có messaging_actor.id')
-      await setCachedUid(pageId, threadId, globalUid)
-      beSaveResolvedUid(pageId, threadId, convThreadKey, globalUid,
-        parseInt(target?.updated_time_precise) || cursorMs)
-      console.log(`[VAESA Bridge] calcUid OK (scan): page=${pageId} thread=${threadId} → ${globalUid} (sau ${i + 1} batches, ${totalScanned} threads)`)
-      return globalUid
-    }
-
-    if (!oldestTime) break  // không paginate được nữa
-    before = oldestTime  // next batch trước thread cuối cùng
-  }
-
-  throw new Error(`FB không tìm thấy thread ${threadId} trong ${totalScanned} threads gần nhất. KH có thể nằm sâu hơn cap 334 của FB pagination — anh cần chạy "Đồng bộ FB UID" 1 lần trong Cài đặt để quét toàn bộ.`)
+  // 3. Quét kiểu Pancake (findThread) — khớp threadId hoặc tên khách.
+  const uid = await resolveUidByName({
+    pageId, customerName, threadId, threadKey: convThreadKey,
+    convUpdatedMs: lastMessageMs,
+  })
+  if (!uid) throw new Error('Không quét được UID khách')
+  if (threadId) await setCachedUid(pageId, threadId, uid)
+  beSaveResolvedUid(pageId, threadId || customerName, convThreadKey, uid, lastMessageMs || Date.now())
+  console.log(`[VAESA Bridge] UID OK (findThread): page=${pageId} thread=${threadId || customerName} → ${uid}`)
+  return uid
 }
 
 // ============== INITIAL SYNC (Phase 1) ==============
