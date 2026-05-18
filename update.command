@@ -4,39 +4,61 @@
 #
 # Toàn bộ logic bọc trong run() — bash đọc hết hàm vào bộ nhớ trước khi chạy,
 # nên dù bước cp có ghi đè chính file này giữa chừng cũng không lỗi.
+#
+# Tải về THƯ MỤC TẠM (mktemp) chứ không tải cạnh file này — vì macOS có thể
+# chạy file .command ở vị trí chỉ-đọc (quarantine/translocation) khiến curl
+# không ghi được file zip → báo "không tải được" dù mạng vẫn tốt.
 run() {
-  cd "$(dirname "$0")" || { echo "[LỖI] Không vào được thư mục extension."; exit 1; }
+  DIR="$(cd "$(dirname "$0")" && pwd)" || { echo "[LỖI] Không vào được thư mục extension."; exit 1; }
 
   echo "============================================"
   echo "   CẬP NHẬT VAESA EXTENSION"
   echo "============================================"
   echo
 
+  TMP="$(mktemp -d 2>/dev/null)" || { echo "[LỖI] Không tạo được thư mục tạm."; read -n 1 -s -r -p "Nhấn phím bất kỳ để đóng..."; exit 1; }
+  ZIP="$TMP/vaesa_update.zip"
+  URL="https://github.com/vaesaltd-netizen/vaesa-extension/archive/refs/heads/master.zip"
+
   echo "[1/3] Đang tải bản mới nhất từ GitHub..."
-  curl -L -s -o "_vaesa_update.zip" "https://github.com/vaesaltd-netizen/vaesa-extension/archive/refs/heads/master.zip"
-  if [ ! -f "_vaesa_update.zip" ]; then
+  HTTP=$(curl -L -f -s --show-error --retry 3 --retry-delay 2 --connect-timeout 20 \
+    -o "$ZIP" -w "%{http_code}" "$URL" 2>"$TMP/err.txt")
+  CODE=$?
+  if [ "$CODE" -ne 0 ] || [ ! -s "$ZIP" ]; then
     echo
-    echo "[LỖI] Không tải được — kiểm tra kết nối mạng rồi chạy lại."
+    echo "[LỖI] Không tải được bản mới (curl exit=$CODE, http=$HTTP)."
+    [ -s "$TMP/err.txt" ] && echo "      Chi tiết: $(cat "$TMP/err.txt")"
+    echo "      → Kiểm tra mạng có vào được github.com không, rồi chạy lại."
+    rm -rf "$TMP"
     echo
     read -n 1 -s -r -p "Nhấn phím bất kỳ để đóng..."
     exit 1
   fi
 
   echo "[2/3] Đang giải nén..."
-  rm -rf "vaesa-extension-master"
-  unzip -q -o "_vaesa_update.zip"
-  if [ ! -d "vaesa-extension-master" ]; then
+  unzip -q -o "$ZIP" -d "$TMP"
+  SRC="$TMP/vaesa-extension-master"
+  if [ ! -d "$SRC" ]; then
     echo
     echo "[LỖI] Giải nén thất bại."
-    rm -f "_vaesa_update.zip"
+    rm -rf "$TMP"
     read -n 1 -s -r -p "Nhấn phím bất kỳ để đóng..."
     exit 1
   fi
 
   echo "[3/3] Đang cập nhật file..."
-  cp -R "vaesa-extension-master/." "."
-  rm -rf "vaesa-extension-master"
-  rm -f "_vaesa_update.zip"
+  if ! cp -R "$SRC/." "$DIR/" 2>"$TMP/cperr.txt"; then
+    echo
+    echo "[LỖI] Không ghi được vào thư mục extension."
+    [ -s "$TMP/cperr.txt" ] && echo "      $(cat "$TMP/cperr.txt")"
+    echo "      → Thư mục đang bị macOS khoá. Mở Terminal, dán lệnh sau rồi Enter:"
+    echo "        xattr -dr com.apple.quarantine \"$DIR\""
+    echo "      sau đó chạy lại file này."
+    rm -rf "$TMP"
+    read -n 1 -s -r -p "Nhấn phím bất kỳ để đóng..."
+    exit 1
+  fi
+  rm -rf "$TMP"
 
   echo
   echo "============================================"
