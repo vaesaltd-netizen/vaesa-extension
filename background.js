@@ -642,8 +642,56 @@ async function resolveCommentGlobalId({ postId, commentId }) {
     ? String(postId).split('_').pop()
     : (postId ? String(postId) : null)
 
-  // Tải HTML bài viết www.facebook.com (port Pancake getGlobalIdFromComment). Ưu tiên
-  // post + comment_id (FB load đúng comment vào context); fallback chỉ comment id.
+  // CÁCH 1 — port Pancake getGlobalIdFromLiveComment (cách Pancake ƯU TIÊN cho comment):
+  // tải trang m.facebook.com của bài viết kèm comment_id; avatar người bình luận nằm
+  // trong phần tử `data-sigil="feed_story_ring{UID}"` → bắt thẳng UID. m.facebook HTML
+  // nhẹ + ổn định hơn www nên Pancake thử cách này trước.
+  if (postShort) {
+    try {
+      const mRes = await fetch(`https://m.facebook.com/${postShort}?comment_id=${commentShort}`, {
+        credentials: 'include',
+        headers: {
+          accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'accept-language': 'en-US,en;q=0.9',
+        },
+      })
+      if (mRes.ok) {
+        const mHtml = await mRes.text()
+        const ring = mHtml.match(/data-sigil="comment">[\s\S]*?data-sigil="feed_story_ring(\d+)/)
+        if (ring) return String(ring[1])
+
+        // CÁCH 1b — port nhánh fallback của getGlobalIdFromLiveComment: nếu regex
+        // feed_story_ring trượt, Pancake quét mọi khối JSON `"comments":` trong CÙNG
+        // HTML m.facebook, tìm edge có node.legacy_token khớp conv rồi lấy node.author.id.
+        const CMARK = '"comments":'
+        let from = 0
+        for (;;) {
+          const ci = mHtml.indexOf(CMARK, from)
+          if (ci < 0) break
+          from = ci + CMARK.length
+          if (mHtml[from] !== '{') continue
+          const objStr = extractBalancedJson(mHtml, from)
+          if (!objStr) continue
+          let parsed
+          try { parsed = JSON.parse(objStr) } catch { continue }
+          const edges = Array.isArray(parsed?.edges) ? parsed.edges : []
+          // Pancake so legacy_token == convId đầy đủ; VAESA chỉ có commentShort nên
+          // khớp khi legacy_token kết thúc bằng comment id đó (id comment là duy nhất).
+          const hit = edges.find((f) => {
+            const lt = String(f?.node?.legacy_token || '')
+            return lt === commentShort || lt.endsWith('_' + commentShort)
+          })
+          const uid = hit?.node?.author?.id
+          if (uid) return String(uid)
+        }
+      }
+    } catch (e) {
+      // m.facebook lỗi → rơi xuống cách www.facebook bên dưới
+    }
+  }
+
+  // CÁCH 2 — www.facebook.com HTML (port getGlobalIdFromComment). Ưu tiên post +
+  // comment_id (FB load đúng comment vào context); fallback chỉ comment id.
   const url = postShort
     ? `https://www.facebook.com/${postShort}?comment_id=${commentShort}`
     : `https://www.facebook.com/${commentShort}`
