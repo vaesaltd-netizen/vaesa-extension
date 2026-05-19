@@ -6,9 +6,14 @@ echo    CAP NHAT VAESA EXTENSION
 echo ============================================
 echo.
 
+REM Don file rac tu ban updater cu — Chrome TU CHOI load extension neu thu muc co
+REM file/folder ten bat dau bang "_". Xoa ngay du updater co chay tiep hay khong.
+del /F /Q "_vaesa_update.zip" >nul 2>&1
+rmdir /S /Q "_vaesa_extract" >nul 2>&1
+
 REM Tai ve thu muc tam (luon ghi duoc) — tranh truong hop thu muc extension chi-doc.
-set "ZIP=%TEMP%\_vaesa_update.zip"
-set "EXDIR=%TEMP%\_vaesa_extract"
+set "ZIP=%TEMP%\vaesa_update.zip"
+set "EXDIR=%TEMP%\vaesa_extract"
 if exist "%ZIP%" del /F /Q "%ZIP%" >nul 2>&1
 if exist "%EXDIR%" rmdir /S /Q "%EXDIR%" >nul 2>&1
 

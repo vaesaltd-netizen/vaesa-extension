@@ -16,6 +16,11 @@ run() {
   echo "============================================"
   echo
 
+  # Dọn file rác từ bản updater cũ — Chrome TỪ CHỐI load extension nếu thư mục có
+  # file/folder tên bắt đầu bằng "_". Xoá ngay dù updater có chạy tiếp hay không.
+  rm -f "$DIR/_vaesa_update.zip"
+  rm -rf "$DIR/_vaesa_extract"
+
   TMP="$(mktemp -d 2>/dev/null)" || { echo "[LỖI] Không tạo được thư mục tạm."; read -n 1 -s -r -p "Nhấn phím bất kỳ để đóng..."; exit 1; }
   ZIP="$TMP/vaesa_update.zip"
   URL="https://github.com/vaesaltd-netizen/vaesa-extension/archive/refs/heads/master.zip"
