@@ -734,7 +734,265 @@ async function resolveCommentGlobalId({ postId, commentId }) {
     if (uid) return uid
   }
 
+  // CÁCH 3 — port nhánh THỨ 4 của Pancake getGlobalIdFromLiveComment (class `Oe`):
+  // crawl HỘP BÌNH LUẬN BUSINESS (business.facebook.com/latest/inbox/facebook). Cách 1/2
+  // chỉ đọc HTML public của post — comment ẩn / post cũ / post hạn chế hiển thị không có
+  // node trong HTML đó nên trượt. Hộp bình luận business thì luôn thấy được mọi comment
+  // gửi vào page (kể cả comment khách đã tự xoá khỏi public). Pancake gọi đúng các
+  // GraphQL query mà giao diện comment-inbox của FB dùng để lấy author.id.
+  if (postShort) {
+    try {
+      const uid = await resolveCommentViaBusinessInbox(postId, postShort, commentShort)
+      if (uid) return uid
+    } catch (e) {
+      console.warn('[VAESA Bridge] CÁCH 3 business inbox fail:', e?.message || e)
+    }
+  }
+
   throw new Error(`Không tìm thấy bình luận ${commentShort} trong post (KH có thể đã xoá comment)`)
+}
+
+// ============== CÁCH 3 — PORT Pancake class `Oe` (business comment inbox) ==============
+// Port verbatim flow của class `Oe` + nhánh 4 getGlobalIdFromLiveComment trong
+// background.js-BW_XvyNi.js (Pancake ext 0.5.45):
+//   Oe.init()                → getHtmlBusinessCommentsView + dựng base/graphql
+//   Oe.getComment()          → getCommentThread → getCommentDetailHeader
+//                              → getViewDetailHeaderTitle → findComment
+//   trả về _.node.author.id  (= UID khách)
+//
+// ĐIỂM KHÁC BIỆT (đã ghi chú rõ — KHÔNG bịa hành vi):
+//  1. Pancake resolve `doc_id` ĐỘNG: class `R` tải HTML hộp bình luận → đọc resource_map
+//     → tải các file JS bundle → regex `name:"<query>",id:"<docid>"`. VAESA port y hệt cơ
+//     chế đó trong loadBizDocIds() (regex JS thuần, không hardcode doc_id — doc_id FB hay
+//     đổi nên hardcode sẽ hỏng).
+//  2. Pancake `re.buildParams()` scrape ~20 field session từ HTML. VAESA chỉ gửi tập tối
+//     thiểu đã VERIFY chạy được ở mbsSearchUid (av/fb_dtsg/lsd + header x-fb-lsd) — FB
+//     chấp nhận tập này cho mọi query business GraphQL.
+//  3. `Oe.searchCommentByUserName` (ưu tiên 1 của Pancake) cần convName — input của
+//     resolveCommentGlobalId KHÔNG có tên khách → VAESA bỏ qua bước này, vào thẳng
+//     getCommentThread như nhánh thứ 2 của Oe.getComment().
+
+// Tên các GraphQL query của hộp bình luận business — copy verbatim từ Pancake (biến
+// He/qt/$t/Ga). doc_id sẽ resolve động theo tên này.
+const BIZ_Q_COMMENT_THREAD_LIST = 'BizInboxCommentThreadListContainerQuery'   // He
+const BIZ_Q_COMMENT_DETAIL_HEADER = 'BizInboxCommentDetailViewHeaderContainerQuery' // qt
+const BIZ_Q_DETAIL_HEADER_TITLE = 'BizInboxCommentDetailViewHeaderFacebookTitleQuery' // $t
+const BIZ_Q_COMMENT_LIST_ROOT = 'CommentListComponentsRootQuery'             // Ga
+
+// Cache doc_id đã resolve trong phiên service worker (Pancake cũng cache qua class `R`).
+const _bizDocIds = {}
+
+// Port Oe.getHtmlBusinessCommentsView — tải HTML view hộp bình luận FB của page.
+async function getHtmlBusinessCommentsView(pageId) {
+  const url = `https://business.facebook.com/latest/inbox/facebook?asset_id=${pageId}&thread_type=FB_PAGE_POST`
+  const res = await fetch(url, {
+    credentials: 'include',
+    headers: {
+      accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'accept-language': 'en-US,en;q=0.9',
+    },
+  })
+  if (!res.ok) throw new Error('business comment view HTTP ' + res.status)
+  return await res.text()
+}
+
+// Port R.loadResource — tải 1 file JS bundle của FB rồi regex bóc cặp (queryName → doc_id).
+// Copy verbatim 4 regex pattern của Pancake (operationKind / id-trước-name /
+// __getDocID / _facebookRelayOperation).
+async function extractDocIdsFromJs(jsUrl, queryNames) {
+  let src = ''
+  try {
+    src = await fetch(jsUrl, { credentials: 'include' }).then(r => r.text())
+  } catch (e) {
+    return {}
+  }
+  const names = queryNames.join('|')
+  const out = {}
+  const patterns = [
+    new RegExp('operationKind:"(?:[^"]+)",name:"(' + names + ')",id:"(\\d+)"', 'g'),
+    new RegExp('id:"(\\d+)",(?:[^:]+:.+,)?name:"(' + names + ')"', 'g'),
+    new RegExp('__d\\("(' + names + ')".+?__getDocID=function\\(\\)\\{return"(\\d+)"', 'g'),
+    new RegExp('__d\\("(' + names + ')_facebookRelayOperation".+?exports="(\\d+)"', 'g'),
+  ]
+  // Pattern 2 đảo thứ tự (id trước name) — Pancake xử lý qua named group, ở đây xét index.
+  let mm
+  for (let pi = 0; pi < patterns.length; pi++) {
+    const re = patterns[pi]
+    while ((mm = re.exec(src))) {
+      if (pi === 1) out[mm[2]] = mm[1]   // pattern 2: group1=id, group2=name
+      else out[mm[1]] = mm[2]            // còn lại: group1=name, group2=id
+    }
+  }
+  return out
+}
+
+// Port R.loadDocIdsFromView + makeResourceMap/getResourceNeedsLoad — tải HTML view,
+// gom URL các file JS (từ resource_map và thẻ <script src>), rồi resolve doc_id.
+async function loadBizDocIds(pageId, html, queryNames) {
+  const need = queryNames.filter(n => !_bizDocIds[n])
+  if (!need.length) return
+  // Gom URL file JS: (a) thẻ <script src="...">, (b) các khối "resource_map"/"rsrcMap".
+  const jsUrls = new Set()
+  for (const m of html.matchAll(/<script[^>]+src="([^"]+\.js[^"]*)"/g)) jsUrls.add(m[1])
+  for (const mark of ['"resource_map":', '"rsrcMap":']) {
+    let from = 0
+    for (;;) {
+      const ci = html.indexOf(mark, from)
+      if (ci < 0) break
+      from = ci + mark.length
+      const objStr = extractBalancedJson(html, from)
+      if (!objStr) continue
+      let map
+      try { map = JSON.parse(objStr) } catch { continue }
+      // resource_map: { hash: { src, type } } — chỉ lấy entry JS.
+      for (const k in map) {
+        const v = map[k]
+        if (v && typeof v === 'object' && typeof v.src === 'string' && /\.js/.test(v.src)) {
+          jsUrls.add(v.src)
+        }
+      }
+    }
+  }
+  // Pancake tải JS theo lô 6 file song song, dừng sớm khi đã đủ doc_id.
+  const urls = [...jsUrls]
+  for (let i = 0; i < urls.length; i += 6) {
+    const batch = urls.slice(i, i + 6)
+    const results = await Promise.all(batch.map(u => extractDocIdsFromJs(u, need)))
+    for (const r of results) Object.assign(_bizDocIds, r)
+    if (need.every(n => _bizDocIds[n])) break
+  }
+}
+
+// Port Y.graphql — gọi 1 query GraphQL tới endpoint business comment-inbox.
+// Tập param tối thiểu đã verify ở mbsSearchUid (av + fb_dtsg + lsd + friendly-name).
+async function bizGraphql(pageId, queryName, variables, tokens) {
+  const docId = _bizDocIds[queryName]
+  if (!docId) throw new Error('Thiếu doc_id ' + queryName)
+  const body = new URLSearchParams()
+  body.set('av', String(pageId))
+  body.set('fb_dtsg', tokens.dtsg)
+  body.set('lsd', tokens.lsd)
+  body.set('fb_api_caller_class', 'RelayModern')
+  body.set('fb_api_req_friendly_name', queryName)
+  body.set('variables', JSON.stringify(variables))
+  body.set('doc_id', docId)
+  const res = await fetch('https://business.facebook.com/api/graphql/', {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+      'x-fb-friendly-name': queryName,
+      'x-fb-lsd': tokens.lsd,
+      'x-asbd-id': '359341',
+    },
+    body: body.toString(),
+  })
+  const txt = await res.text()
+  let data
+  try { data = JSON.parse(txt) } catch { throw new Error(queryName + ' trả về không phải JSON (HTTP ' + res.status + ')') }
+  if (data?.errors?.length) throw new Error(queryName + ' error: ' + (data.errors[0]?.message || 'unknown'))
+  return data
+}
+
+// Port Oe.getCommentDetailHeader — trả commItem (có comm_source_id = fb post id).
+async function bizGetCommentDetailHeader(pageId, commItemId, tokens) {
+  const d = await bizGraphql(pageId, BIZ_Q_COMMENT_DETAIL_HEADER, { commItemID: commItemId }, tokens)
+  return d?.data?.commItem || null
+}
+
+// Port Oe.getCommentThread — duyệt danh sách comm_item của hộp bình luận (đệ quy theo
+// cursor), tìm comm_item có comm_source_id == fb post id. Pancake giới hạn 10 vòng.
+async function bizGetCommentThread(pageId, postShort, tokens, depth = 0, cursor = null) {
+  const vars = {
+    pageID: String(pageId),
+    count: 20,
+    cursor,
+    filterType: null,
+    filterIsReadStatus: null,
+    filterOwnerID: null,
+    filterStatus: 'TODO',
+    platformFilter: 'FACEBOOK',
+    isHighlightedComment: false,
+    isStarsComment: false,
+  }
+  const d = await bizGraphql(pageId, BIZ_Q_COMMENT_THREAD_LIST, vars, tokens)
+  const conn = d?.data?.page?.business_comm_items
+  const edges = conn?.edges || []
+  for (const edge of edges) {
+    const header = await bizGetCommentDetailHeader(pageId, edge?.node?.id, tokens).catch(() => null)
+    if (header && String(header.comm_source_id) === String(postShort)) return edge
+  }
+  if (depth < 10 && conn?.page_info?.end_cursor) {
+    return bizGetCommentThread(pageId, postShort, tokens, depth + 1, conn.page_info.end_cursor)
+  }
+  return null
+}
+
+// Port Oe.getViewDetailHeaderTitle — từ post id (target_id của commItem) lấy feedback
+// object của post (feedback.id dùng làm input cho findComment).
+async function bizGetViewDetailHeaderTitle(pageId, postId, tokens) {
+  const d = await bizGraphql(pageId, BIZ_Q_DETAIL_HEADER_TITLE, { postID: postId }, tokens)
+  return d?.data?.facebook_post?.feedback || null
+}
+
+// Port Oe.findComment — query CommentListComponentsRootQuery theo feedback id rồi tìm
+// edge có node.legacy_fbid == comment id → trả node.author.id (UID khách).
+async function bizFindComment(pageId, feedbackId, commentShort, tokens) {
+  const vars = {
+    commentsIntentToken: 'RANKED_UNFILTERED_CHRONOLOGICAL_REPLIES_INTENT_V1',
+    feedLocation: 'BUSINESS_COMMENT_INBOX_TAB',
+    feedbackSource: 107,
+    focusCommentID: null,
+    scale: 1,
+    useDefaultActor: false,
+    id: feedbackId,
+  }
+  const d = await bizGraphql(pageId, BIZ_Q_COMMENT_LIST_ROOT, vars, tokens)
+  const comments = d?.data?.node?.comment_rendering_instance_for_feed_location?.comments
+  const edges = comments?.edges || []
+  // khớp trực tiếp theo legacy_fbid (Pancake làm y hệt trong findComment + findTargetComment)
+  for (const edge of edges) {
+    if (String(edge?.node?.legacy_fbid) === String(commentShort)) {
+      const uid = edge?.node?.author?.id
+      if (uid) return String(uid)
+    }
+    // comment có thể là reply lồng — quét luôn replies (port findTargetComment đệ quy)
+    const replyEdges = edge?.node?.feedback?.comment_rendering_instance_for_feed_location
+      ?.comments?.edges || []
+    for (const re of replyEdges) {
+      if (String(re?.node?.legacy_fbid) === String(commentShort)) {
+        const uid = re?.node?.author?.id
+        if (uid) return String(uid)
+      }
+    }
+  }
+  return null
+}
+
+// Điều phối CÁCH 3 — port Oe.getComment() (bỏ nhánh searchCommentByUserName vì thiếu tên).
+async function resolveCommentViaBusinessInbox(postId, postShort, commentShort) {
+  const pageId = postId && String(postId).includes('_')
+    ? String(postId).split('_')[0]
+    : null
+  if (!pageId) throw new Error('CÁCH 3: không suy ra được pageId từ postId')
+
+  // init() — tải HTML hộp bình luận business để resolve doc_id (port Oe.init + R).
+  const html = await getHtmlBusinessCommentsView(pageId)
+  await loadBizDocIds(pageId, html, [
+    BIZ_Q_COMMENT_THREAD_LIST, BIZ_Q_COMMENT_DETAIL_HEADER,
+    BIZ_Q_DETAIL_HEADER_TITLE, BIZ_Q_COMMENT_LIST_ROOT,
+  ])
+  // token dtsg/lsd lấy từ chính trang business (tái dùng mbsFetchTokens đã verify).
+  const tokens = await mbsFetchTokens()
+
+  // getComment(): tìm comm_item của post → header → feedback id → findComment.
+  const threadEdge = await bizGetCommentThread(pageId, postShort, tokens)
+  if (!threadEdge) return null
+  const header = await bizGetCommentDetailHeader(pageId, threadEdge?.node?.id, tokens)
+  if (!header) return null
+  const feedback = await bizGetViewDetailHeaderTitle(pageId, header.target_id, tokens)
+  if (!feedback) return null
+  return await bizFindComment(pageId, feedback.id, commentShort, tokens)
 }
 
 // ============== PHASE 2: RESOLVE UID CONV CŨ (port Pancake ge.findThread) ==============
