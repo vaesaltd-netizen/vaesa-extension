@@ -631,9 +631,11 @@ function findCommentAuthorIdDeep(obj, commentId, depth = 0) {
 }
 
 // Resolve UID khách từ 1 bình luận.
-//   postId    — Pancake conv.post_id (dạng "{owner}_{postLegacy}") — có thể null
-//   commentId — comment legacy id (= Pancake conv.id phần sau '_')
-async function resolveCommentGlobalId({ postId, commentId }) {
+//   postId       — Pancake conv.post_id (dạng "{owner}_{postLegacy}") — có thể null
+//   commentId    — comment legacy id (= Pancake conv.id phần sau '_')
+//   customerName — tên khách (= Pancake `convName`). Dùng cho CÁCH 3
+//                  searchCommentByUserName — cách ƯU TIÊN của Pancake `Oe.getComment`.
+async function resolveCommentGlobalId({ postId, commentId, customerName }) {
   if (!commentId) throw new Error('Thiếu commentId')
   const commentShort = String(commentId).includes('_')
     ? String(commentId).split('_').pop()
@@ -742,7 +744,7 @@ async function resolveCommentGlobalId({ postId, commentId }) {
   // GraphQL query mà giao diện comment-inbox của FB dùng để lấy author.id.
   if (postShort) {
     try {
-      const uid = await resolveCommentViaBusinessInbox(postId, postShort, commentShort)
+      const uid = await resolveCommentViaBusinessInbox(postId, postShort, commentShort, commentId, customerName)
       if (uid) return uid
     } catch (e) {
       console.warn('[VAESA Bridge] CÁCH 3 business inbox fail:', e?.message || e)
@@ -756,7 +758,8 @@ async function resolveCommentGlobalId({ postId, commentId }) {
 // Port verbatim flow của class `Oe` + nhánh 4 getGlobalIdFromLiveComment trong
 // background.js-BW_XvyNi.js (Pancake ext 0.5.45):
 //   Oe.init()                → getHtmlBusinessCommentsView + dựng base/graphql
-//   Oe.getComment()          → getCommentThread → getCommentDetailHeader
+//   Oe.getComment()          → searchCommentByUserName (ƯU TIÊN) → nếu trượt thì
+//                              getCommentThread → getCommentDetailHeader
 //                              → getViewDetailHeaderTitle → findComment
 //   trả về _.node.author.id  (= UID khách)
 //
@@ -768,16 +771,20 @@ async function resolveCommentGlobalId({ postId, commentId }) {
 //  2. Pancake `re.buildParams()` scrape ~20 field session từ HTML. VAESA chỉ gửi tập tối
 //     thiểu đã VERIFY chạy được ở mbsSearchUid (av/fb_dtsg/lsd + header x-fb-lsd) — FB
 //     chấp nhận tập này cho mọi query business GraphQL.
-//  3. `Oe.searchCommentByUserName` (ưu tiên 1 của Pancake) cần convName — input của
-//     resolveCommentGlobalId KHÔNG có tên khách → VAESA bỏ qua bước này, vào thẳng
-//     getCommentThread như nhánh thứ 2 của Oe.getComment().
+//  3. `Oe.getComment` thử `searchCommentByUserName` TRƯỚC (cần convName = tên khách),
+//     chỉ fallback `getCommentThread` khi cách kia trượt. VAESA port đủ cả hai:
+//     resolveCommentGlobalId nhận thêm `customerName` để chạy được cách ưu tiên này.
 
-// Tên các GraphQL query của hộp bình luận business — copy verbatim từ Pancake (biến
-// He/qt/$t/Ga). doc_id sẽ resolve động theo tên này.
+// Tên các GraphQL query của hộp bình luận business — copy verbatim từ Pancake. doc_id
+// sẽ resolve động theo tên này (biến minify Pancake ghi trong ngoặc).
 const BIZ_Q_COMMENT_THREAD_LIST = 'BizInboxCommentThreadListContainerQuery'   // He
 const BIZ_Q_COMMENT_DETAIL_HEADER = 'BizInboxCommentDetailViewHeaderContainerQuery' // qt
 const BIZ_Q_DETAIL_HEADER_TITLE = 'BizInboxCommentDetailViewHeaderFacebookTitleQuery' // $t
 const BIZ_Q_COMMENT_LIST_ROOT = 'CommentListComponentsRootQuery'             // Ga
+// searchCommentByUserName dùng thêm 3 query — Te/ht/Re (xem grep Pancake source):
+const BIZ_Q_CUSTOMER_SEARCH = 'BizInboxCustomerRelaySearchSourceQuery'       // Te — page_unified_customer_search
+const BIZ_Q_SEARCH_RESULT_LIST = 'BizInboxSearchResultListContainerQuery'    // ht — CrmUnifiedContact.facebook_comms
+const BIZ_Q_POST_DETAIL_WRAPPER = 'BizInboxPostDetailViewWrapperQuery'       // Re — comment_list_renderer
 
 // Cache doc_id đã resolve trong phiên service worker (Pancake cũng cache qua class `R`).
 const _bizDocIds = {}
@@ -797,8 +804,12 @@ async function getHtmlBusinessCommentsView(pageId) {
 }
 
 // Port R.loadResource — tải 1 file JS bundle của FB rồi regex bóc cặp (queryName → doc_id).
-// Copy verbatim 4 regex pattern của Pancake (operationKind / id-trước-name /
-// __getDocID / _facebookRelayOperation).
+// Copy VERBATIM 5 regex pattern của Pancake R.loadResource (background.js dòng 7784):
+//   1. operationKind:"...",name:"<q>",id:"<docid>"
+//   2. id:"<docid>",(...,)?name:"<q>"                (đảo thứ tự id↔name)
+//   3. __d("<q>"...__getDocID=function(){return"<docid>"      — CHỈ khi 1+2 trượt
+//   4. __d("<q>_instagramRelayOperation"...exports="<docid>"  — CHỈ khi vẫn trượt
+//   5. __d("<q>_facebookRelayOperation"...exports="<docid>"   — luôn nối thêm
 async function extractDocIdsFromJs(jsUrl, queryNames) {
   let src = ''
   try {
@@ -808,21 +819,22 @@ async function extractDocIdsFromJs(jsUrl, queryNames) {
   }
   const names = queryNames.join('|')
   const out = {}
-  const patterns = [
-    new RegExp('operationKind:"(?:[^"]+)",name:"(' + names + ')",id:"(\\d+)"', 'g'),
-    new RegExp('id:"(\\d+)",(?:[^:]+:.+,)?name:"(' + names + ')"', 'g'),
-    new RegExp('__d\\("(' + names + ')".+?__getDocID=function\\(\\)\\{return"(\\d+)"', 'g'),
-    new RegExp('__d\\("(' + names + ')_facebookRelayOperation".+?exports="(\\d+)"', 'g'),
-  ]
-  // Pattern 2 đảo thứ tự (id trước name) — Pancake xử lý qua named group, ở đây xét index.
-  let mm
-  for (let pi = 0; pi < patterns.length; pi++) {
-    const re = patterns[pi]
-    while ((mm = re.exec(src))) {
-      if (pi === 1) out[mm[2]] = mm[1]   // pattern 2: group1=id, group2=name
-      else out[mm[1]] = mm[2]            // còn lại: group1=name, group2=id
-    }
+  // hits: mảng {name, id} — Pancake duyệt NGƯỢC rồi set, ở đây gom rồi set tuần tự.
+  let hits = []
+  const collect = (re, nameIdx, idIdx) => {
+    let mm
+    while ((mm = re.exec(src))) hits.push({ name: mm[nameIdx], id: mm[idIdx] })
   }
+  collect(new RegExp('operationKind:"(?:[^"]+)",name:"(' + names + ')",id:"(\\d+)"', 'g'), 1, 2)
+  collect(new RegExp('id:"(\\d+)",(?:[^:]+:.+,)?name:"(' + names + ')"', 'g'), 2, 1)
+  if (!hits.length) {
+    collect(new RegExp('__d\\("(' + names + ')".+?__getDocID=function\\(\\)\\{return"(\\d+)"', 'g'), 1, 2)
+  }
+  if (!hits.length) {
+    collect(new RegExp('__d\\("(' + names + ')_instagramRelayOperation".+?exports="(\\d+)"', 'g'), 1, 2)
+  }
+  collect(new RegExp('__d\\("(' + names + ')_facebookRelayOperation".+?exports="(\\d+)"', 'g'), 1, 2)
+  for (const h of hits) out[h.name] = h.id
   return out
 }
 
@@ -892,6 +904,40 @@ async function bizGraphql(pageId, queryName, variables, tokens) {
   try { data = JSON.parse(txt) } catch { throw new Error(queryName + ' trả về không phải JSON (HTTP ' + res.status + ')') }
   if (data?.errors?.length) throw new Error(queryName + ' error: ' + (data.errors[0]?.message || 'unknown'))
   return data
+}
+
+// Port Y.graphql với parseResponse = (ye) => ye.text() — query trả TEXT thô (Pancake
+// dùng cho BizInboxPostDetailViewWrapperQuery vì response không phải JSON thuần mà là
+// chuỗi chứa nhiều block JSON streaming). Gửi kèm tham số __comet_req=11... như Pancake.
+async function bizGraphqlText(pageId, queryName, variables, tokens) {
+  const docId = _bizDocIds[queryName]
+  if (!docId) throw new Error('Thiếu doc_id ' + queryName)
+  const body = new URLSearchParams()
+  body.set('av', String(pageId))
+  body.set('fb_dtsg', tokens.dtsg)
+  body.set('lsd', tokens.lsd)
+  body.set('fb_api_caller_class', 'RelayModern')
+  body.set('fb_api_req_friendly_name', queryName)
+  body.set('variables', JSON.stringify(variables))
+  body.set('doc_id', docId)
+  // tham số extra verbatim Pancake (đối số thứ 3 của graphql cho query Re).
+  body.set('__aaid', '0')
+  body.set('__ccg', 'EXCELLENT')
+  body.set('__comet_req', '11')
+  body.set('__jssesw', '1')
+  body.set('server_timestamps', 'true')
+  const res = await fetch('https://business.facebook.com/api/graphql/', {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+      'x-fb-friendly-name': queryName,
+      'x-fb-lsd': tokens.lsd,
+      'x-asbd-id': '359341',
+    },
+    body: body.toString(),
+  })
+  return await res.text()
 }
 
 // Port Oe.getCommentDetailHeader — trả commItem (có comm_source_id = fb post id).
@@ -969,8 +1015,162 @@ async function bizFindComment(pageId, feedbackId, commentShort, tokens) {
   return null
 }
 
-// Điều phối CÁCH 3 — port Oe.getComment() (bỏ nhánh searchCommentByUserName vì thiếu tên).
-async function resolveCommentViaBusinessInbox(postId, postShort, commentShort) {
+// Port helper Pancake `U` — quét toàn chuỗi, sau MỖI lần gặp `marker` trích object
+// JSON cân ngoặc liền sau → trả MẢNG các chuỗi JSON. (extractBalancedJson chỉ lấy 1).
+function extractAllJsonAfterMarker(str, marker) {
+  const out = []
+  let from = 0
+  for (;;) {
+    const ci = str.indexOf(marker, from)
+    if (ci < 0) break
+    from = ci + marker.length
+    // bỏ khoảng trắng tới ký tự '{'
+    let p = from
+    while (p < str.length && (str[p] === ' ' || str[p] === '\n' || str[p] === '\r' || str[p] === '\t')) p++
+    if (str[p] !== '{') continue
+    const objStr = extractBalancedJson(str, p)
+    if (objStr) { out.push(objStr); from = p + objStr.length }
+  }
+  return out
+}
+
+// ============== Port Oe.searchCommentByUserName (cách ƯU TIÊN của Pancake) ==============
+// Pancake `Oe.getComment` gọi searchCommentByUserName TRƯỚC getCommentThread. Cần convName
+// (= tên khách). Flow verbatim (background.js dòng 2414–2625):
+//   1. graphql(Te) = page_unified_customer_search {pageID,count:5,cursor:null,
+//      searchTerm:convName,channel:'FACEBOOK',selectedIgAssetId:null}
+//   2. lọc edges có node.name === convName
+//   3. nếu đúng 1 match & allowPrioritySearchByName & node.user.id
+//        → trả {node:{author:{id: node.user.id}}}  (KẾT THÚC SỚM)
+//   4. ngược lại: với mỗi match → graphql(ht) = CrmUnifiedContact.facebook_comms
+//      {count:null,cursor:null,pageCustomerID: node.id}
+//   5. với mỗi facebook_comms edge → commItemID = node.parent_item.id || node.node.id
+//      → graphql(Re, ee, ...) = BizInboxPostDetailViewWrapperQuery (parse .text())
+//   6. quét '"comment_list_renderer":' trong response → feedback.id (gọi findComment)
+//      và comment_rendering...comments.edges → khớp node.legacy_fbid === comment id
+// allowPrioritySearchByName: theo yêu cầu coi như TRUE.
+async function bizSearchCommentByUserName(pageId, convId, convName, postShort, tokens) {
+  if (!convName) return null
+  // convId Pancake dạng "{post}_{comment}" → e = comment legacy id phần sau '_'.
+  const commentLegacy = String(convId).includes('_') ? String(convId).split('_')[1] : String(convId)
+
+  // bước 1 — page_unified_customer_search.
+  const searchVars = {
+    pageID: String(pageId),
+    count: 5,
+    cursor: null,
+    searchTerm: convName,
+    channel: 'FACEBOOK',
+    selectedIgAssetId: null,
+  }
+  const a = await bizGraphql(pageId, BIZ_Q_CUSTOMER_SEARCH, searchVars, tokens)
+  const edges = a?.data?.page?.page_unified_customer_search?.edges
+  if (!edges || !edges.length) return null
+
+  // bước 2 — lọc edges có node.name === convName (so khớp tuyệt đối, đúng Pancake).
+  const matched = edges.filter((F) => F?.node?.name === convName)
+
+  // bước 3 — đúng 1 match + có user.id → trả ngay {node:{author:{id}}}.
+  if (matched.length === 1 && matched[0]?.node?.user?.id) {
+    return { node: { author: { id: String(matched[0].node.user.id) } } }
+  }
+
+  // bước 4-6 — với mỗi match, query facebook_comms rồi crawl comment_list_renderer.
+  for (const F of matched) {
+    const commsVars = { count: null, cursor: null, pageCustomerID: F?.node?.id }
+    let N
+    try {
+      N = await bizGraphql(pageId, BIZ_Q_SEARCH_RESULT_LIST, commsVars, tokens)
+    } catch (e) { continue }
+    const commEdges = N?.data?.CrmUnifiedContact?.facebook_comms?.edges
+    if (!commEdges || !commEdges.length) continue
+
+    for (const k of commEdges) {
+      const commItemID = k?.node?.parent_item?.id || k?.node?.node?.id
+      if (!commItemID) continue
+      // bước 5 — BizInboxPostDetailViewWrapperQuery, response trả TEXT (không phải JSON
+      // thuần), ee = bộ biến verbatim Pancake (dòng 2546-2563).
+      const ee = {
+        commItemID,
+        feedLocation: 'BUSINESS_COMMENT_INBOX_TAB',
+        feedbackSource: 107,
+        focusCommentID: null,
+        privacySelectorRenderLocation: 'BUSINESS_COMMENT_INBOX_TAB',
+        scale: 1,
+        useDefaultActor: false,
+        renderLocation: 'business_comment_inbox_tab',
+        __relay_internal__pv__CometImmersivePhotoCanUserDisable3DMotionrelayprovider: false,
+        __relay_internal__pv__IsWorkUserrelayprovider: false,
+        __relay_internal__pv__IsMergQAPollsrelayprovider: false,
+        __relay_internal__pv__CometUFIReactionsEnableShortNamerelayprovider: false,
+        __relay_internal__pv__CometUFIShareActionMigrationrelayprovider: true,
+        __relay_internal__pv__IncludeCommentWithAttachmentrelayprovider: true,
+        __relay_internal__pv__StoriesArmadilloReplyEnabledrelayprovider: false,
+        __relay_internal__pv__EventCometCardImage_prefetchEventImagerelayprovider: false,
+      }
+      let de
+      try {
+        de = await bizGraphqlText(pageId, BIZ_Q_POST_DETAIL_WRAPPER, ee, tokens)
+      } catch (e) { continue }
+
+      // bước 6 — quét mọi block '"comment_list_renderer":' (port Pancake `U(de,...)`).
+      const blocks = extractAllJsonAfterMarker(de, '"comment_list_renderer":')
+      let feedbackIds = []
+      for (const blk of blocks) {
+        try {
+          const he = JSON.parse(blk)
+          if (he?.feedback?.id) feedbackIds.push(he.feedback.id)
+          const cEdges = he?.feedback?.comment_rendering_instance_for_feed_location?.comments?.edges
+          if (cEdges && cEdges.length) {
+            for (const xe of cEdges) {
+              // Pancake: node.legacy_fbid === e (comment legacy id) → trả nguyên edge.
+              if (String(xe?.node?.legacy_fbid) === String(commentLegacy)) return xe
+            }
+          }
+          // các feedback id còn lại → findComment tuần tự (Pancake làm y hệt).
+          feedbackIds = feedbackIds.filter(Boolean)
+          for (const fid of feedbackIds) {
+            const ue = await bizFindCommentEdge(pageId, convId, fid, tokens)
+            if (ue) return ue
+          }
+        } catch (e) { /* block lỗi → bỏ qua, đúng Pancake try/catch rỗng */ }
+      }
+    }
+  }
+  return null
+}
+
+// Port Oe.findComment — query CommentListComponentsRootQuery theo feedback id, trả
+// nguyên EDGE khớp node.legacy_fbid (Pancake trả `d` = edge, .node.author.id là UID).
+async function bizFindCommentEdge(pageId, convId, feedbackId, tokens) {
+  const commentLegacy = String(convId).includes('_') ? String(convId).split('_')[1] : String(convId)
+  const vars = {
+    commentsIntentToken: 'RANKED_UNFILTERED_CHRONOLOGICAL_REPLIES_INTENT_V1',
+    feedLocation: 'BUSINESS_COMMENT_INBOX_TAB',
+    feedbackSource: 107,
+    focusCommentID: null,
+    scale: 1,
+    useDefaultActor: false,
+    id: feedbackId,
+  }
+  let d
+  try {
+    d = await bizGraphql(pageId, BIZ_Q_COMMENT_LIST_ROOT, vars, tokens)
+  } catch (e) { return null }
+  const edges = d?.data?.node?.comment_rendering_instance_for_feed_location?.comments?.edges || []
+  for (const edge of edges) {
+    if (String(edge?.node?.legacy_fbid) === String(commentLegacy)) return edge
+    const replyEdges = edge?.node?.feedback?.comment_rendering_instance_for_feed_location
+      ?.comments?.edges || []
+    for (const re of replyEdges) {
+      if (String(re?.node?.legacy_fbid) === String(commentLegacy)) return re
+    }
+  }
+  return null
+}
+
+// Điều phối CÁCH 3 — port Oe.getComment(): searchCommentByUserName (ưu tiên) → getCommentThread.
+async function resolveCommentViaBusinessInbox(postId, postShort, commentShort, convId, customerName) {
   const pageId = postId && String(postId).includes('_')
     ? String(postId).split('_')[0]
     : null
@@ -981,11 +1181,27 @@ async function resolveCommentViaBusinessInbox(postId, postShort, commentShort) {
   await loadBizDocIds(pageId, html, [
     BIZ_Q_COMMENT_THREAD_LIST, BIZ_Q_COMMENT_DETAIL_HEADER,
     BIZ_Q_DETAIL_HEADER_TITLE, BIZ_Q_COMMENT_LIST_ROOT,
+    BIZ_Q_CUSTOMER_SEARCH, BIZ_Q_SEARCH_RESULT_LIST, BIZ_Q_POST_DETAIL_WRAPPER,
   ])
   // token dtsg/lsd lấy từ chính trang business (tái dùng mbsFetchTokens đã verify).
   const tokens = await mbsFetchTokens()
 
-  // getComment(): tìm comm_item của post → header → feedback id → findComment.
+  // convIdFull = "{post}_{comment}" — Pancake `Oe.convId`. postId Pancake = "{page}_{post}".
+  const convIdFull = `${postShort}_${commentShort}`
+
+  // (1) ƯU TIÊN — searchCommentByUserName (port Oe.getComment nhánh đầu).
+  if (customerName) {
+    try {
+      const found = await bizSearchCommentByUserName(pageId, convIdFull, customerName, postShort, tokens)
+      // Pancake trả {node:{author:{id}}} → UID = node.author.id.
+      const uid = found?.node?.author?.id
+      if (uid) return String(uid)
+    } catch (e) {
+      console.warn('[VAESA Bridge] searchCommentByUserName fail:', e?.message || e)
+    }
+  }
+
+  // (2) FALLBACK — getCommentThread → header → feedback id → findComment.
   const threadEdge = await bizGetCommentThread(pageId, postShort, tokens)
   if (!threadEdge) return null
   const header = await bizGetCommentDetailHeader(pageId, threadEdge?.node?.id, tokens)
@@ -1200,7 +1416,7 @@ async function runCommentResolve({ pageId, onProgress }) {
         // Conv bình luận → resolve qua comment HTML
         const convId = row.pancake_conv_id || ''
         const commentId = convId.includes('_') ? convId.split('_').pop() : (row.page_comm_id || '')
-        if (commentId) uid = await resolveCommentGlobalId({ postId: row.post_id, commentId })
+        if (commentId) uid = await resolveCommentGlobalId({ postId: row.post_id, commentId, customerName: row.customer_name })
       } else if (row.thread_id || row.customer_name) {
         // Conv inbox → quét threadlist khớp tên khách (Phase 2 — port Pancake findThread)
         uid = await resolveInboxGlobalId({
@@ -2236,6 +2452,8 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         return { ok: true, started: true }
       case 'VAESA_RESOLVE_ONE_COMMENT':
         // Resolve 1 conv comment on-demand, trả UID ngay.
+        // payload: { postId, commentId, customerName } — customerName cho CÁCH 3
+        // searchCommentByUserName (cách ưu tiên của Pancake Oe.getComment).
         return { ok: true, globalUid: await resolveCommentGlobalId(req.payload || {}) }
       case 'VAESA_RESOLVE_ONE_INBOX': {
         // Resolve 1 conv inbox CŨ on-demand (Phase 2 — quét threadlist khớp tên).
