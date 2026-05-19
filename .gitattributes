@@ -2,3 +2,7 @@
 update.command text eol=lf
 *.command text eol=lf
 *.sh text eol=lf
+
+# Script batch cho Windows — BẮT BUỘC xuống dòng CRLF, nếu LF cmd.exe đọc sai lệnh.
+update.bat text eol=crlf
+*.bat text eol=crlf
