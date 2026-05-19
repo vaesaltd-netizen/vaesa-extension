@@ -4,5 +4,6 @@ update.command text eol=lf
 *.sh text eol=lf
 
 # Script batch cho Windows — BẮT BUỘC xuống dòng CRLF, nếu LF cmd.exe đọc sai lệnh.
-update.bat text eol=crlf
-*.bat text eol=crlf
+# Để -text (coi như nhị phân) → git KHÔNG đổi xuống dòng, file zip tải về giữ y nguyên CRLF.
+update.bat -text
+*.bat -text
