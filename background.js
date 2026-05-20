@@ -1480,9 +1480,15 @@ function calcMessageKey() {
   return encodeMessageKey((time.toString(2) + saltStr).slice(-63))
 }
 
-async function buildSendBody({ pageId, clientUid, text, imageIds }) {
+async function buildSendBody({ pageId, clientUid, text, imageIds, audioIds, videoIds, fileIds }) {
   const dtsg = await getDtsg()
   const messageKey = calcMessageKey()
+  const hasAtt = !!(
+    (imageIds && imageIds.length) ||
+    (audioIds && audioIds.length) ||
+    (videoIds && videoIds.length) ||
+    (fileIds && fileIds.length)
+  )
   const body = {
     client_id: 'mercury',
     action_type: 'ma-type:user-generated-message',
@@ -1495,12 +1501,13 @@ async function buildSendBody({ pageId, clientUid, text, imageIds }) {
     request_user_id: pageId,
     fb_dtsg: dtsg,
     __a: 1,
-    has_attachment: !!(imageIds && imageIds.length),
+    has_attachment: hasAtt,
   }
   if (text) body.body = text
-  if (imageIds && imageIds.length) {
-    imageIds.forEach((id, i) => { body[`image_ids[${i}]`] = id })
-  }
+  if (imageIds && imageIds.length) imageIds.forEach((id, i) => { body[`image_ids[${i}]`] = id })
+  if (audioIds && audioIds.length) audioIds.forEach((id, i) => { body[`audio_ids[${i}]`] = id })
+  if (videoIds && videoIds.length) videoIds.forEach((id, i) => { body[`video_ids[${i}]`] = id })
+  if (fileIds && fileIds.length) fileIds.forEach((id, i) => { body[`file_ids[${i}]`] = id })
   return body
 }
 
@@ -1570,9 +1577,15 @@ async function uploadOneFile({ pageId, fileBase64, fileMime, fileName }) {
   }
 
   const json = JSON.parse(text.replace(/^for ?\(;;\);/, ''))
-  const imageId = json?.payload?.metadata?.[0]?.image_id
-  if (!imageId) throw new Error('Upload không trả image_id')
-  return imageId
+  const meta = json?.payload?.metadata?.[0]
+  if (!meta) throw new Error('Upload không trả metadata')
+  // Mercury upload trả 1 trong các key: image_id / audio_id / video_id / file_id
+  // tuỳ mime input. Trả về cả id và kind để send build đúng field name.
+  if (meta.image_id) return { id: meta.image_id, kind: 'image' }
+  if (meta.audio_id) return { id: meta.audio_id, kind: 'audio' }
+  if (meta.video_id) return { id: meta.video_id, kind: 'video' }
+  if (meta.file_id)  return { id: meta.file_id,  kind: 'file' }
+  throw new Error('Upload không trả id (image/audio/video/file)')
 }
 
 // ============== GỬI TIN KIỂU PANCAKE (port sendInbox / buildSendParams) ==============
@@ -1675,7 +1688,7 @@ function pcOfflineThreadingID() {
 }
 
 // Port InboxNormal.buildSendParams (nhánh facebook).
-function pcBuildSendParams({ pageId, globalUid, text, imageIds, ctx }) {
+function pcBuildSendParams({ pageId, globalUid, text, imageIds, audioIds, videoIds, fileIds, ctx }) {
   const otid = pcOfflineThreadingID()
   let u = {
     body: text || '',
@@ -1692,10 +1705,17 @@ function pcBuildSendParams({ pageId, globalUid, text, imageIds, ctx }) {
   u.client = 'mercury'
   u.action_type = 'ma-type:user-generated-message'
   u.ephemeral_ttl_mode = 0
-  u.has_attachment = !!(imageIds && imageIds.length)
-  if (imageIds && imageIds.length) {
-    imageIds.forEach((id, i) => { u['image_ids[' + i + ']'] = id })
-  }
+  const hasAtt = !!(
+    (imageIds && imageIds.length) ||
+    (audioIds && audioIds.length) ||
+    (videoIds && videoIds.length) ||
+    (fileIds && fileIds.length)
+  )
+  u.has_attachment = hasAtt
+  if (imageIds && imageIds.length) imageIds.forEach((id, i) => { u['image_ids[' + i + ']'] = id })
+  if (audioIds && audioIds.length) audioIds.forEach((id, i) => { u['audio_ids[' + i + ']'] = id })
+  if (videoIds && videoIds.length) videoIds.forEach((id, i) => { u['video_ids[' + i + ']'] = id })
+  if (fileIds && fileIds.length)   fileIds.forEach((id, i)   => { u['file_ids['  + i + ']'] = id })
   return u
 }
 
@@ -1718,10 +1738,10 @@ async function pcGetCtx(pageId, force) {
 }
 
 // Gửi 1 tin kiểu Pancake — POST business.facebook.com/messaging/send/.
-async function sendViaPancake({ pageId, globalUid, text, imageIds }) {
+async function sendViaPancake({ pageId, globalUid, text, imageIds, audioIds, videoIds, fileIds }) {
   if (!globalUid) throw new Error('sendViaPancake: thiếu UID khách')
   const ctx = await pcGetCtx(pageId)
-  const params = pcBuildSendParams({ pageId, globalUid, text, imageIds, ctx })
+  const params = pcBuildSendParams({ pageId, globalUid, text, imageIds, audioIds, videoIds, fileIds, ctx })
   const body = Object.keys(params)
     .map(k => encodeURIComponent(k) + '=' + encodeURIComponent(params[k]))
     .join('&')
@@ -2054,36 +2074,46 @@ async function actionSendText({ pageId, threadId, threadKey, lastMessageMs, body
 async function actionSendFile({ pageId, threadId, threadKey, lastMessageMs, body, files, globalUid, customerName }) {
   const clientUid = globalUid || await calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs, customerName })
 
-  // Upload từng file
-  const imageIds = []
+  // Upload từng file, gom theo loại (image / audio / video / file) — FB Mercury upload
+  // trả KEY KHÁC NHAU theo mime input (`image_id` / `audio_id` / `video_id` / `file_id`),
+  // và send params dùng field tương ứng (`image_ids[i]` / `audio_ids[i]`...).
+  const byKind = { image: [], audio: [], video: [], file: [] }
   for (const f of files || []) {
     try {
-      const id = await uploadOneFile({
+      const up = await uploadOneFile({
         pageId,
         fileBase64: f.data,
         fileMime: f.type,
         fileName: f.name,
       })
-      if (id) imageIds.push(id)
+      if (up?.id) (byKind[up.kind] || byKind.file).push(up.id)
     } catch (e) {
       console.warn('[VAESA Bridge] upload 1 file fail:', e?.message || e)
     }
   }
-  if (!imageIds.length) throw new Error('Không upload được file nào')
+  const totalUploaded = byKind.image.length + byKind.audio.length + byKind.video.length + byKind.file.length
+  if (!totalUploaded) throw new Error('Không upload được file nào')
+
+  const sendArgs = {
+    pageId, globalUid: clientUid, text: body,
+    imageIds: byKind.image, audioIds: byKind.audio,
+    videoIds: byKind.video, fileIds: byKind.file,
+  }
 
   // Đường Pancake — ưu tiên.
   try {
-    const r = await sendViaPancake({ pageId, globalUid: clientUid, text: body, imageIds })
-    return { ok: true, clientUid, imageIds, payload: r.payload, via: 'pancake' }
+    const r = await sendViaPancake(sendArgs)
+    return { ok: true, clientUid, attachments: byKind, payload: r.payload, via: 'pancake' }
   } catch (e) {
     console.warn('[VAESA Bridge] Pancake send (file) fail, fallback Mercury cũ:', e?.message || e)
   }
   // Fallback: Mercury tối giản cũ.
-  const sendBody = await buildSendBody({ pageId, clientUid, text: body, imageIds })
+  const sendBody = await buildSendBody({ pageId, clientUid, text: body,
+    imageIds: byKind.image, audioIds: byKind.audio, videoIds: byKind.video, fileIds: byKind.file })
   const { text } = await sendFBMessage(sendBody)
   const parsed = parseFBResponse(text)
   if (!parsed.ok) throw new Error(parsed.error || 'Gửi thất bại')
-  return { ok: true, clientUid, imageIds, payload: parsed.payload, via: 'mercury' }
+  return { ok: true, clientUid, attachments: byKind, payload: parsed.payload, via: 'mercury' }
 }
 
 async function actionStatus() {
