@@ -2594,3 +2594,23 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   })
   return true
 })
+
+// ============== AUTO-RELOAD KHI FILE DISK ĐƯỢC UPDATE ==============
+// Vấn đề: update.bat (qua VBS Startup) overwrite các file extension trên disk, nhưng Chrome
+// KHÔNG tự reload extension unpacked → runtime giữ bản cũ, NV phải tự bấm Reload ở chrome://extensions.
+// Fix: mỗi 60s đọc lại manifest.json từ disk (qua chrome.runtime.getURL + cache no-cache), so
+// version với bản đang chạy. Khác → chrome.runtime.reload() → Chrome reload, picks up bản mới.
+const _VAESA_LOADED_VERSION = chrome.runtime.getManifest().version
+async function _vaesaCheckDiskVersion() {
+  try {
+    const url = chrome.runtime.getURL('manifest.json') + '?t=' + Date.now()
+    const res = await fetch(url, { cache: 'no-cache' })
+    const m = await res.json()
+    if (m?.version && m.version !== _VAESA_LOADED_VERSION) {
+      console.log('[VAESA] disk = v' + m.version + ', runtime = v' + _VAESA_LOADED_VERSION + ' → reload')
+      chrome.runtime.reload()
+    }
+  } catch {}
+}
+setInterval(_vaesaCheckDiskVersion, 60 * 1000)
+_vaesaCheckDiskVersion()
