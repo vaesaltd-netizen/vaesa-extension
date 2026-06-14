@@ -1283,12 +1283,11 @@ async function resolveUidByName({ pageId, customerName, convUpdatedMs, threadId,
   }
   const name = customerName ? String(customerName).trim() : ''
   const tKey = threadKey ? String(threadKey).replace(/^t_/, '') : ''
-  // Cursor bắt đầu: Pancake dùng convUpdatedTime+60s, nhưng updated_at của Pancake
-  // có thể lệch updated_time của FB tới vài giờ → đệm RỘNG 7 ngày cho chắc (đệm to
-  // chỉ tốn vài thread quét thừa, KHÔNG bao giờ bỏ sót thread cần tìm).
-  const startCursor = Number(convUpdatedMs) > 0
-    ? Number(convUpdatedMs) + 7 * 86400000
-    : Date.now() + 86400000
+  // Cursor bắt đầu: GIỐNG PANCAKE = thời gian conv + 60s (verify source Pancake 2026-06-14:
+  // findThread dùng conversationUpdatedTime+60000). Nhảy ĐÚNG vào thời điểm hội thoại → thread
+  // đích nằm ngay lô đầu. BUG CŨ: đệm +7 NGÀY → page đông >200 thread/7ngày → cạn giới hạn 200
+  // (FINDTHREAD_MAX_PER_TAG) TRƯỚC khi tới thread đích → báo "không tìm thấy" oan.
+  const baseCursor = Number(convUpdatedMs) > 0 ? Number(convUpdatedMs) + 60000 : Date.now()
 
   const matches = (t) => {
     if (threadId) {
@@ -1301,33 +1300,44 @@ async function resolveUidByName({ pageId, customerName, convUpdatedMs, threadId,
     return false
   }
 
-  for (const tags of FINDTHREAD_TAG_CASCADE) {
-    let before = startCursor
-    let scanned = 0
-    while (scanned < FINDTHREAD_MAX_PER_TAG) {
-      let nodes
-      try {
-        nodes = await fetchThreadListFull(pageId, before, tags)
-      } catch (e) {
-        console.warn(`[VAESA Bridge] threadlist ${tags} fail:`, e?.message || e)
-        break
-      }
-      if (!nodes.length) break
-      scanned += nodes.length
-      const hit = nodes.find(matches)
-      if (hit) {
-        const uid = hit?.thread_key?.other_user_id
-        if (uid && String(uid) !== String(pageId)) {
-          console.log(`[VAESA Bridge] resolveUidByName OK (${tags}): "${name || threadId}" → ${uid}`)
-          return String(uid)
+  // Quét cascade tag (INBOX→ARCHIVED→...) bắt đầu từ 1 mốc cho trước. Trả uid hoặc ''.
+  const scanFrom = async (startBefore) => {
+    for (const tags of FINDTHREAD_TAG_CASCADE) {
+      let before = startBefore
+      let scanned = 0
+      while (scanned < FINDTHREAD_MAX_PER_TAG) {
+        let nodes
+        try {
+          nodes = await fetchThreadListFull(pageId, before, tags)
+        } catch (e) {
+          console.warn(`[VAESA Bridge] threadlist ${tags} fail:`, e?.message || e)
+          break
         }
+        if (!nodes.length) break
+        scanned += nodes.length
+        const hit = nodes.find(matches)
+        if (hit) {
+          const uid = hit?.thread_key?.other_user_id
+          if (uid && String(uid) !== String(pageId)) {
+            console.log(`[VAESA Bridge] resolveUidByName OK (${tags}): "${name || threadId}" → ${uid}`)
+            return String(uid)
+          }
+        }
+        if (nodes.length < FINDTHREAD_LIMIT) break  // hết thread trong tag này
+        const last = parseInt(nodes[nodes.length - 1].updated_time_precise) || 0
+        if (!last || last >= before) break          // không lùi được nữa → tránh lặp vô hạn
+        before = last
       }
-      if (nodes.length < FINDTHREAD_LIMIT) break  // hết thread trong tag này
-      const last = parseInt(nodes[nodes.length - 1].updated_time_precise) || 0
-      if (!last || last >= before) break          // không lùi được nữa → tránh lặp vô hạn
-      before = last
     }
+    return ''
   }
+
+  // 1) Quét từ mốc conv (+60s) — trúng khi mốc Pancake khớp/đi sau thời gian FB.
+  let uid = await scanFrom(baseCursor)
+  // 2) Dự phòng (port nhánh "B" của Pancake findThread): quét lại từ HIỆN TẠI — trúng khi FB
+  //    mới hơn mốc Pancake (updated_at Pancake lag) → thread nằm SAU con trỏ +60s.
+  if (!uid) uid = await scanFrom(Date.now())
+  if (uid) return uid
   throw new Error(`Không tìm thấy thread cho "${name || threadId}" (đã quét INBOX/ARCHIVED/PAGE_BACKGROUND/OTHER)`)
 }
 
