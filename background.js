@@ -1278,32 +1278,52 @@ function threadParticipantNames(t) {
 
 // Port Pancake ge.findThread — quét threadlist tìm thread theo TÊN khách
 // (hoặc threadId/threadKey nếu có). Trả UID (thread_key.other_user_id) hoặc throw.
-async function resolveUidByName({ pageId, customerName, convUpdatedMs, threadId, threadKey }) {
+async function resolveUidByName({ pageId, customerName, convUpdatedMs, threadId, threadKey, psid }) {
   if (!pageId) throw new Error('resolveUidByName: thiếu pageId')
   if (!customerName && !threadId && !threadKey) {
     throw new Error('resolveUidByName: thiếu customerName/threadId/threadKey')
   }
   const name = customerName ? String(customerName).trim() : ''
   const tKey = threadKey ? String(threadKey).replace(/^t_/, '') : ''
-  // Cursor bắt đầu: GIỐNG PANCAKE = thời gian conv + 60s (verify source Pancake 2026-06-14:
-  // findThread dùng conversationUpdatedTime+60000). Nhảy ĐÚNG vào thời điểm hội thoại → thread
-  // đích nằm ngay lô đầu. BUG CŨ: đệm +7 NGÀY → page đông >200 thread/7ngày → cạn giới hạn 200
-  // (FINDTHREAD_MAX_PER_TAG) TRƯỚC khi tới thread đích → báo "không tìm thấy" oan.
+  const pid = psid ? String(psid) : ''
+  // Cursor: GIỐNG PANCAKE = conversationUpdatedTime + 60s. Mốc nay CHÍNH XÁC nhờ webapp parse UTC
+  // (trước lệch 7h → quét trượt window). BUG cũ +7 NGÀY → cạn 200/tag trước khi tới thread đích.
   const baseCursor = Number(convUpdatedMs) > 0 ? Number(convUpdatedMs) + 60000 : Date.now()
 
-  const matches = (t) => {
+  // isAllActorArePage — CLONE Pancake: đúng 2 participant + MỌI messaging_actor.__typename==='Page'
+  // (khách hiển thị vai trò page) → lúc đó khớp bằng PSID trong participants.
+  const allActorsArePage = (t) => {
+    const edges = t?.all_participants?.edges
+    if (!Array.isArray(edges) || edges.length !== 2) return false
+    return !edges.find((r) => r?.node?.messaging_actor?.__typename !== 'Page')
+  }
+  // KHỚP theo ID (ƯU TIÊN — clone Pancake findThread): thread kiểu page → PSID; còn lại →
+  // page_comm_item.id/comm_source_id === threadId, hoặc comm_source_id === threadKey, hoặc thread_fbid.
+  const matchById = (t) => {
+    if (pid && allActorsArePage(t)) {
+      const ids = (t?.all_participants?.edges || []).map((e) => String(e?.node?.messaging_actor?.id || ''))
+      if (ids.includes(pid)) return true
+    }
     if (threadId) {
       const id = String(threadId)
       if (t?.page_comm_item?.id === id || t?.page_comm_item?.comm_source_id === id ||
           t?.thread_key?.thread_fbid === id) return true
     }
     if (tKey && t?.page_comm_item?.comm_source_id === tKey) return true
-    if (name && threadParticipantNames(t).includes(name)) return true
     return false
   }
+  // KHỚP theo TÊN — chỉ là LƯỢT CUỐI khi KHÔNG có ID nào khớp (clone Pancake: name fallback gated,
+  // KHÔNG ưu tiên). BUG CŨ: tên ngang hàng ID trong cùng 1 find → vớ nhầm khách TRÙNG TÊN đứng trước.
+  const matchByName = (t) => !!(name && threadParticipantNames(t).includes(name))
 
-  // Quét cascade tag (INBOX→ARCHIVED→...) bắt đầu từ 1 mốc cho trước. Trả uid hoặc ''.
-  const scanFrom = async (startBefore) => {
+  // CLONE Pancake extractGlobalId: UID khách LUÔN = thread_key.other_user_id.
+  const uidOf = (t) => {
+    const uid = t?.thread_key?.other_user_id
+    return uid && String(uid) !== String(pageId) ? String(uid) : ''
+  }
+
+  // Quét cascade tag (INBOX→ARCHIVED→...) bằng 1 hàm khớp; trả uid hoặc ''.
+  const scanFrom = async (startBefore, matchFn, label) => {
     for (const tags of FINDTHREAD_TAG_CASCADE) {
       let before = startBefore
       let scanned = 0
@@ -1317,12 +1337,12 @@ async function resolveUidByName({ pageId, customerName, convUpdatedMs, threadId,
         }
         if (!nodes.length) break
         scanned += nodes.length
-        const hit = nodes.find(matches)
+        const hit = nodes.find(matchFn)
         if (hit) {
-          const uid = hit?.thread_key?.other_user_id
-          if (uid && String(uid) !== String(pageId)) {
-            console.log(`[VAESA Bridge] resolveUidByName OK (${tags}): "${name || threadId}" → ${uid}`)
-            return String(uid)
+          const uid = uidOf(hit)
+          if (uid) {
+            console.log(`[VAESA Bridge] resolveUidByName OK (${label}/${tags}): "${name || threadId}" → ${uid}`)
+            return uid
           }
         }
         if (nodes.length < FINDTHREAD_LIMIT) break  // hết thread trong tag này
@@ -1334,12 +1354,13 @@ async function resolveUidByName({ pageId, customerName, convUpdatedMs, threadId,
     return ''
   }
 
-  // CLONE Pancake findThread: 1 MỐC duy nhất = convUpdatedMs + 60s (conversationUpdatedTime+60000).
-  // Mốc này nay CHÍNH XÁC nhờ webapp parse giờ UTC đúng (trước lệch 7h → quét trượt window) → 1 lần là thấy.
-  let uid = await scanFrom(baseCursor)
-  // Lưới an toàn (VAESA thêm, KHÔNG có ở Pancake): phòng khi mốc Pancake vẫn lag hơn thời gian FB
-  // → quét lại từ hiện tại. Sau khi vá parse UTC thì gần như không bao giờ phải dùng tới.
-  if (!uid) uid = await scanFrom(Date.now())
+  // 1) ƯU TIÊN khớp ID (2 mốc: conv-time + hiện tại) — cách Pancake mặc định dùng.
+  let uid = await scanFrom(baseCursor, matchById, 'id')
+  if (!uid) uid = await scanFrom(Date.now(), matchById, 'id')
+  // 2) LƯỢT CUỐI: khớp tên — CHỈ khi ID hoàn toàn không ra (phòng conv không có ID khớp). KHÔNG
+  //    bao giờ để tên đè ID → hết lẫn khách trùng tên.
+  if (!uid && name) uid = await scanFrom(baseCursor, matchByName, 'name')
+  if (!uid && name) uid = await scanFrom(Date.now(), matchByName, 'name')
   if (uid) return uid
   throw new Error(`Không tìm thấy thread cho "${name || threadId}" (đã quét INBOX/ARCHIVED/PAGE_BACKGROUND/OTHER)`)
 }
@@ -1388,9 +1409,9 @@ function extractInboxGlobalId(html, pageId, threadId) {
   return best
 }
 
-async function resolveInboxGlobalId({ pageId, threadId, customerName, convUpdatedMs, threadKey }) {
-  // Phase 2: quét threadlist khớp tên khách (port Pancake findThread).
-  return await resolveUidByName({ pageId, customerName, convUpdatedMs, threadId, threadKey })
+async function resolveInboxGlobalId({ pageId, threadId, customerName, convUpdatedMs, threadKey, psid }) {
+  // Phase 2: quét threadlist khớp ID (ưu tiên) → tên (lượt cuối), port Pancake findThread.
+  return await resolveUidByName({ pageId, customerName, convUpdatedMs, threadId, threadKey, psid })
 }
 
 // ============== PHASE 1C — resolve hàng loạt conv comment thiếu UID ==============
@@ -2502,7 +2523,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         // Resolve 1 conv inbox CŨ on-demand (Phase 2 — quét threadlist khớp tên).
         // payload: { pageId, customerName, convUpdatedMs, psid?, threadId?, threadKey? }
         const { pageId, customerName, convUpdatedMs, psid, threadId, threadKey } = req.payload || {}
-        const uid = await resolveUidByName({ pageId, customerName, convUpdatedMs, threadId, threadKey })
+        const uid = await resolveUidByName({ pageId, customerName, convUpdatedMs, threadId, threadKey, psid })
         // Cache theo khoá ổn định của conv cũ (PSID), fallback threadId.
         const cacheKey = psid || threadId
         if (cacheKey) {
