@@ -447,6 +447,19 @@ async function calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs, custo
     convThreadKey = convThreadKey || beRow?.thread_key || ''
   }
 
+  // 2.5 — Query TRỰC TIẾP kiểu Pancake (AdminAssigner/Mercury): lấy global_id thẳng theo
+  // threadId/threadKey, KHÔNG cần khớp tên → bắt được conv mà findThread bỏ sót (gốc bug
+  // "Pancake quét ra mà VAESA không"). Đây là tier 1+2 Pancake mà bản cũ thiếu.
+  try {
+    const gid = await getGlobalIdViaInboxQuery({ pageId, threadId, threadKey: convThreadKey })
+    if (gid) {
+      if (threadId) await setCachedUid(pageId, threadId, gid)
+      beSaveResolvedUid(pageId, threadId || customerName, convThreadKey, gid, lastMessageMs || Date.now())
+      console.log(`[VAESA Bridge] UID OK (inbox-query): page=${pageId} thread=${threadId} → ${gid}`)
+      return gid
+    }
+  } catch (e) { /* rớt xuống findThread */ }
+
   // 3. Quét kiểu Pancake (findThread) — khớp threadId hoặc tên khách.
   const uid = await resolveUidByName({
     pageId, customerName, threadId, threadKey: convThreadKey,
@@ -877,7 +890,7 @@ async function loadBizDocIds(pageId, html, queryNames) {
 
 // Port Y.graphql — gọi 1 query GraphQL tới endpoint business comment-inbox.
 // Tập param tối thiểu đã verify ở mbsSearchUid (av + fb_dtsg + lsd + friendly-name).
-async function bizGraphql(pageId, queryName, variables, tokens) {
+async function bizGraphql(pageId, queryName, variables, tokens, extraParams) {
   const docId = _bizDocIds[queryName]
   if (!docId) throw new Error('Thiếu doc_id ' + queryName)
   const body = new URLSearchParams()
@@ -888,6 +901,9 @@ async function bizGraphql(pageId, queryName, variables, tokens) {
   body.set('fb_api_req_friendly_name', queryName)
   body.set('variables', JSON.stringify(variables))
   body.set('doc_id', docId)
+  // Tham số phụ (vd cquick/cquick_token/ctarget của Mercury query) — Pancake graphql() Object.assign
+  // vào params rồi encode 1 lần; URLSearchParams.set cũng encode 1 lần → khớp wire (ctarget đã pre-encode).
+  if (extraParams) for (const k in extraParams) body.set(k, String(extraParams[k]))
   const res = await fetch('https://business.facebook.com/api/graphql/', {
     method: 'POST',
     credentials: 'include',
@@ -904,6 +920,60 @@ async function bizGraphql(pageId, queryName, variables, tokens) {
   try { data = JSON.parse(txt) } catch { throw new Error(queryName + ' trả về không phải JSON (HTTP ' + res.status + ')') }
   if (data?.errors?.length) throw new Error(queryName + ' error: ' + (data.errors[0]?.message || 'unknown'))
   return data
+}
+
+// ============== TIER 1+2 — Pancake getGlobalIdFromInbox (lấy global_id THẲNG) ==============
+// Pancake ext 0.5.45 (class `ge`.getGlobalIdFromInbox, verify bundle 2026-06-15) lấy global_id
+// qua 2 query FB TRƯỚC khi findThread (quét tên). VAESA cũ CHỈ có findThread (tác giả tưởng nhầm
+// Pancake không có 2 tầng kia) → conv mà findThread không khớp tên/sai tag thì SÓT, dù Pancake quét ra.
+//   Tier 1: PagesManagerInboxAdminAssignerRootQuery {pageID, commItemID:threadId}
+//           → data.commItem.target_id
+//   Tier 2: PagesManagerInboxQueryUtilCommItemHeaderMercuryQuery {pageID, messageThreadID:threadKey}
+//           + cquick (compat_iframe_token) → data.page.page_comm_item_for_message_thread.target_id
+// doc_id + compat token resolve ĐỘNG từ HTML hộp thư FB của page (giống Pancake makeInboxViewUrl),
+// KHÔNG hardcode (doc_id FB hay đổi). Tái dùng loadBizDocIds/bizGraphql/mbsFetchTokens sẵn có.
+const Q_INBOX_ADMIN_ASSIGNER = 'PagesManagerInboxAdminAssignerRootQuery'
+const Q_INBOX_MERCURY = 'PagesManagerInboxQueryUtilCommItemHeaderMercuryQuery'
+const _inboxCompatToken = {}  // pageId -> compat_iframe_token (= cquick_token cho Mercury)
+
+async function getGlobalIdViaInboxQuery({ pageId, threadId, threadKey }) {
+  if (!pageId || (!threadId && !threadKey)) return null
+  // Nạp doc_id (+ compat token) từ HTML hộp thư FB của page — giống Pancake makeInboxViewUrl.
+  if (!_bizDocIds[Q_INBOX_ADMIN_ASSIGNER] || !_bizDocIds[Q_INBOX_MERCURY] || !_inboxCompatToken[pageId]) {
+    try {
+      const html = await (await fetch(`https://www.facebook.com/${pageId}/inbox`, {
+        credentials: 'include',
+        headers: { accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'accept-language': 'en-US,en;q=0.9' },
+      })).text()
+      await loadBizDocIds(pageId, html, [Q_INBOX_ADMIN_ASSIGNER, Q_INBOX_MERCURY])
+      const cm = html.match(/"compat_iframe_token":"([^"]+)"/)
+      if (cm) _inboxCompatToken[pageId] = cm[1]
+    } catch (e) { /* vẫn thử với doc_id đã cache nếu có */ }
+  }
+  let tokens
+  try { tokens = await mbsFetchTokens() } catch { return null }
+
+  // Tier 1: AdminAssignerRootQuery qua threadId (commItemID).
+  if (threadId && _bizDocIds[Q_INBOX_ADMIN_ASSIGNER]) {
+    try {
+      const d = await bizGraphql(pageId, Q_INBOX_ADMIN_ASSIGNER, { pageID: String(pageId), commItemID: String(threadId) }, tokens)
+      const gid = d?.data?.commItem?.target_id
+      if (gid) return String(gid)
+    } catch (e) { console.log('[VAESA Bridge] AdminAssigner miss:', String(e?.message || e)) }
+  }
+  // Tier 2: Mercury qua threadKey (messageThreadID) + cquick. ctarget pre-encode để URLSearchParams
+  // ra wire double-encode KHỚP Pancake.
+  if (threadKey && _bizDocIds[Q_INBOX_MERCURY] && _inboxCompatToken[pageId]) {
+    try {
+      const d = await bizGraphql(pageId, Q_INBOX_MERCURY,
+        { pageID: String(pageId), messageThreadID: String(threadKey).replace(/^t_/, '') },
+        tokens,
+        { cquick: 'jsc_c_d', cquick_token: _inboxCompatToken[pageId], ctarget: 'https%3A%2F%2Fwww.facebook.com', av: String(pageId) })
+      const gid = d?.data?.page?.page_comm_item_for_message_thread?.target_id
+      if (gid) return String(gid)
+    } catch (e) { console.log('[VAESA Bridge] Mercury miss:', String(e?.message || e)) }
+  }
+  return null
 }
 
 // Port Y.graphql với parseResponse = (ye) => ye.text() — query trả TEXT thô (Pancake
