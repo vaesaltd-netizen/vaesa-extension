@@ -1332,19 +1332,12 @@ async function resolveUidByName({ pageId, customerName, convUpdatedMs, threadId,
     return ''
   }
 
-  // Quét SONG SONG 2 mốc, trả về UID NGAY khi mốc nào trúng trước (verify thật conv "Thuyen Pham"
-  // 2026-06-15: tuần tự mất 24s, song song ~3s):
-  //  - now: bắt thread vừa bị đẩy lên gần đây (vd vừa GỌI điện → thread FB mới hơn updated_at Pancake;
-  //    conv "Thuyen Pham" updated_at lag ~7h → quét mốc cũ KHÔNG BAO GIỜ thấy vì thread mới hơn `before`).
-  //  - baseCursor (convUpdatedMs+60s): bắt conv CŨ (đứng sau nhiều thread mới → quét từ now sẽ tốn lô).
-  const cursors = [...new Set([Date.now(), baseCursor].filter((c) => Number(c) > 0))]
-  const uid = await new Promise((resolve) => {
-    let pending = cursors.length
-    let found = ''
-    cursors.forEach((c) => scanFrom(c)
-      .then((u) => { if (u && !found) { found = u; resolve(u) }; if (--pending === 0) resolve(found) })
-      .catch(() => { if (--pending === 0) resolve(found) }))
-  })
+  // CLONE Pancake findThread: 1 MỐC duy nhất = convUpdatedMs + 60s (conversationUpdatedTime+60000).
+  // Mốc này nay CHÍNH XÁC nhờ webapp parse giờ UTC đúng (trước lệch 7h → quét trượt window) → 1 lần là thấy.
+  let uid = await scanFrom(baseCursor)
+  // Lưới an toàn (VAESA thêm, KHÔNG có ở Pancake): phòng khi mốc Pancake vẫn lag hơn thời gian FB
+  // → quét lại từ hiện tại. Sau khi vá parse UTC thì gần như không bao giờ phải dùng tới.
+  if (!uid) uid = await scanFrom(Date.now())
   if (uid) return uid
   throw new Error(`Không tìm thấy thread cho "${name || threadId}" (đã quét INBOX/ARCHIVED/PAGE_BACKGROUND/OTHER)`)
 }
