@@ -408,8 +408,10 @@ function threadToRow(t) {
 // Ghi UID vừa resolve vào D1 ĐÚNG theo threadId Pancake — khoá mà chip + gửi tin tra cứu.
 // BẮT BUỘC ghi riêng: threadToRow khoá row theo comm_source_id (≠ Pancake thread_id) nên
 // row nó đẩy lên không bao giờ update được row Pancake → UID resolve xong mà D1 vẫn rỗng.
+// Trả PROMISE để caller AWAIT — SW MV3 bị Chrome tắt ngay sau khi handler return; nếu ghi D1
+// fire-and-forget (không await) thì POST chết giữa chừng → "quét xong mà không lưu" → F5 quét lại.
 function beSaveResolvedUid(pageId, threadId, threadKey, uid, updatedMs) {
-  bePost('sync', { page_id: pageId, threads: [{
+  return bePost('sync', { page_id: pageId, threads: [{
     thread_id: String(threadId),
     client_uid: String(uid),
     thread_key: threadKey || null,
@@ -454,7 +456,7 @@ async function calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs, custo
   })
   if (!uid) throw new Error('Không quét được UID khách')
   if (threadId) await setCachedUid(pageId, threadId, uid)
-  beSaveResolvedUid(pageId, threadId || customerName, convThreadKey, uid, lastMessageMs || Date.now())
+  await beSaveResolvedUid(pageId, threadId || customerName, convThreadKey, uid, lastMessageMs || Date.now())
   console.log(`[VAESA Bridge] UID OK (findThread): page=${pageId} thread=${threadId || customerName} → ${uid}`)
   return uid
 }
@@ -2505,7 +2507,7 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         const cacheKey = psid || threadId
         if (cacheKey) {
           await setCachedUid(pageId, cacheKey, uid)
-          beSaveResolvedUid(pageId, cacheKey, threadKey || null, uid, convUpdatedMs || Date.now())
+          await beSaveResolvedUid(pageId, cacheKey, threadKey || null, uid, convUpdatedMs || Date.now())
         }
         return { ok: true, globalUid: uid }
       }

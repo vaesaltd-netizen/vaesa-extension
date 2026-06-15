@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "VAESA Extension",
-  "version": "3.12.9",
+  "version": "3.12.10",
   "description": "Cầu nối VAESA Livechat — gửi tin Facebook không giới hạn 24h.",
 
   "icons": {
