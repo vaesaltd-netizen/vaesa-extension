@@ -2086,6 +2086,56 @@ async function actionSendTextMqtt({ pageId, threadId, body }) {
   return await sendViaMqtt({ pageId, threadId, body })
 }
 
+// Gửi FILE/ẢNH qua MQTT (tầng socket — clone Pancake executeBySocket file path).
+// attachmentFbids = fb_id đã upload (uploadOneFile). CLONE verbatim payload Pancake bundle
+// (_app-…v6.js): mỗi file 1 task label "46" với
+//   { attachment_fbids:[fbid], mark_thread_read:0, otid, send_type:3, source:0, sync_group:205, text:null, thread_id:clientUid }
+// (khác task text: send_type 3 thay 1, có attachment_fbids, text:null, mark_thread_read 0.)
+async function sendFileViaMqtt({ pageId, threadId, lastMessageMs, attachmentFbids, clientUid: clientUidArg }) {
+  if (!pageId) throw new Error('Thiếu pageId')
+  if (!attachmentFbids || !attachmentFbids.length) throw new Error('MQTT file: thiếu attachment_fbids')
+  const currentUid = await getCurrentUid()
+  if (!currentUid) throw new Error('Chưa scrape được FB current UID')
+  const clientUid = clientUidArg || await calcGlobalUid({ pageId, threadId, lastMessageMs })
+  if (!clientUid) throw new Error('MQTT file: không resolve được UID khách')
+  const ws = await _wsConnectOrReuse(pageId, currentUid)
+  _wsRequestId++
+  const fileTasks = attachmentFbids.map((fbid) => ({
+    failure_count: null,
+    label: '46',
+    payload: JSON.stringify({
+      attachment_fbids: [String(fbid)],
+      mark_thread_read: 0,
+      otid: _wsEpochId(),
+      send_type: 3,
+      source: 0,
+      sync_group: 205,
+      text: null,
+      thread_id: String(clientUid),
+    }),
+    queue_name: String(clientUid),
+    task_id: ++_wsTaskId,
+  }))
+  const readTask = {
+    failure_count: null,
+    label: '21',
+    payload: JSON.stringify({ thread_id: String(clientUid), last_read_watermark_ts: Date.now(), sync_group: 205 }),
+    queue_name: String(clientUid),
+    task_id: ++_wsTaskId,
+  }
+  const task = {
+    app_id: String(FB_WS_APP_ID),
+    payload: { epoch_id: _wsEpochId(), tasks: [...fileTasks, readTask], version_id: FB_WS_VERSION_ID },
+    request_id: _wsRequestId,
+    type: 3,
+  }
+  const packet = _mqttPublishTaskWrapped(FB_WS_TOPIC, task, 50, _wsRequestId > 10 ? 11 : _wsRequestId)
+  ws.send(packet)
+  await new Promise((resolve) => setTimeout(resolve, 1200))
+  if (ws.readyState !== WebSocket.OPEN) throw new Error('MQTT WS đóng ngay sau send file — fail')
+  return { ok: true, via: 'mqtt-file', threadId, requestId: _wsRequestId }
+}
+
 // ============== TOP-LEVEL ACTIONS ==============
 
 async function actionSendText({ pageId, threadId, threadKey, lastMessageMs, body, globalUid, customerName }) {
@@ -2135,19 +2185,41 @@ async function actionSendFile({ pageId, threadId, threadKey, lastMessageMs, body
   }
 
   // Đường Pancake — ưu tiên.
+  let pancakeErr = null
   try {
     const r = await sendViaPancake(sendArgs)
     return { ok: true, clientUid, attachments: byKind, payload: r.payload, via: 'pancake' }
   } catch (e) {
+    pancakeErr = e
     console.warn('[VAESA Bridge] Pancake send (file) fail, fallback Mercury cũ:', e?.message || e)
   }
   // Fallback: Mercury tối giản cũ.
-  const sendBody = await buildSendBody({ pageId, clientUid, text: body,
-    imageIds: byKind.image, audioIds: byKind.audio, videoIds: byKind.video, fileIds: byKind.file })
-  const { text } = await sendFBMessage(sendBody)
-  const parsed = parseFBResponse(text)
-  if (!parsed.ok) throw new Error(parsed.error || 'Gửi thất bại')
-  return { ok: true, clientUid, attachments: byKind, payload: parsed.payload, via: 'mercury' }
+  let mercuryErr = null
+  try {
+    const sendBody = await buildSendBody({ pageId, clientUid, text: body,
+      imageIds: byKind.image, audioIds: byKind.audio, videoIds: byKind.video, fileIds: byKind.file })
+    const { text } = await sendFBMessage(sendBody)
+    const parsed = parseFBResponse(text)
+    if (!parsed.ok) throw new Error(parsed.error || 'Gửi thất bại')
+    return { ok: true, clientUid, attachments: byKind, payload: parsed.payload, via: 'mercury' }
+  } catch (e) {
+    mercuryErr = e
+  }
+  // Tầng socket (clone Pancake executeBySocket): HTTP fail với "không có mặt"/session →
+  // gửi file qua MQTT dùng fb_id ĐÃ upload (không upload lại). Cùng điều kiện eligible-error
+  // như text-MQTT (vaesaFbBridge.tryFallback24h) để nhất quán.
+  const fileErrMsg = String(mercuryErr?.message || pancakeErr?.message || '')
+  const allFbids = [...byKind.image, ...byKind.audio, ...byKind.video, ...byKind.file]
+  if (allFbids.length && /1545041|không có mặt|isn'?t available|currently away|1357004|session/i.test(fileErrMsg)) {
+    try {
+      console.log('[VAESA Bridge] HTTP file fail → thử MQTT (socket tier):', fileErrMsg)
+      await sendFileViaMqtt({ pageId, threadId, lastMessageMs, attachmentFbids: allFbids, clientUid })
+      return { ok: true, clientUid, attachments: byKind, via: 'mqtt-file' }
+    } catch (mqttErr) {
+      console.warn('[VAESA Bridge] MQTT file cũng fail:', mqttErr?.message)
+    }
+  }
+  throw mercuryErr || pancakeErr || new Error('Gửi file thất bại')
 }
 
 async function actionStatus() {
