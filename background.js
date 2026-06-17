@@ -1853,6 +1853,36 @@ async function actionSendFile({ pageId, threadId, threadKey, lastMessageMs, body
   throw mercuryErr || pancakeErr || new Error('Gửi file thất bại')
 }
 
+// Gửi tin với fb_id ĐÃ có sẵn (web app lấy từ /contents/facebook is_reusable=false) — KHÔNG khiêng
+// file ở máy. CLONE Pancake (verify MCP 2026-06-17): gửi ảnh >24h = tham chiếu image_ids → Mercury,
+// ~1-2s. Dùng cho CHAT THỦ CÔNG (gửi 1-1). actionSendFile (upload bytes) giữ cho gửi loạt + fallback.
+async function actionSendPreuploaded({ pageId, threadId, threadKey, lastMessageMs, body, globalUid, customerName, imageIds, videoIds, fileIds, audioIds }) {
+  const clientUid = globalUid || await calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs, customerName })
+  const img = Array.isArray(imageIds) ? imageIds.filter(Boolean) : []
+  const vid = Array.isArray(videoIds) ? videoIds.filter(Boolean) : []
+  const fil = Array.isArray(fileIds) ? fileIds.filter(Boolean) : []
+  const aud = Array.isArray(audioIds) ? audioIds.filter(Boolean) : []
+  if (!img.length && !vid.length && !fil.length && !aud.length && !(body && body.trim())) {
+    throw new Error('Không có nội dung gửi (preuploaded)')
+  }
+  const sendArgs = { pageId, globalUid: clientUid, text: body, imageIds: img, audioIds: aud, videoIds: vid, fileIds: fil }
+  const attachments = { image: img, audio: aud, video: vid, file: fil }
+  let pancakeErr = null
+  try {
+    const r = await sendViaPancake(sendArgs)
+    return { ok: true, clientUid, attachments, payload: r.payload, via: 'pancake' }
+  } catch (e) {
+    pancakeErr = e
+    console.warn('[VAESA Bridge] Pancake send (preuploaded) fail, fallback Mercury cũ:', e?.message || e)
+  }
+  const sendBody = await buildSendBody({ pageId, clientUid, text: body,
+    imageIds: img, audioIds: aud, videoIds: vid, fileIds: fil })
+  const { text } = await sendFBMessage(sendBody)
+  const parsed = parseFBResponse(text)
+  if (!parsed.ok) throw new Error(parsed.error || pancakeErr?.message || 'Gửi thất bại')
+  return { ok: true, clientUid, attachments, payload: parsed.payload, via: 'mercury' }
+}
+
 async function actionStatus() {
   try {
     const fbCookie = await chrome.cookies.get({ url: 'https://www.facebook.com', name: 'c_user' })
@@ -2186,6 +2216,8 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         return await actionSendText(req.payload || {})
       case 'VAESA_SEND_FILE':
         return await actionSendFile(req.payload || {})
+      case 'VAESA_SEND_PREUPLOADED':
+        return await actionSendPreuploaded(req.payload || {})
       case 'VAESA_CLEAR_UID_CACHE': {
         const cleared = await idbClear()
         // Legacy: cũng dọn chrome.storage.local từ v3.0.x trước khi đổi sang IDB.
