@@ -1644,13 +1644,18 @@ async function uploadOneFile({ pageId, fileBase64, fileMime, fileName }) {
   const json = JSON.parse(text.replace(/^for ?\(;;\);/, ''))
   const meta = json?.payload?.metadata?.[0]
   if (!meta) throw new Error('Upload không trả metadata')
-  // Mercury upload trả 1 trong các key: image_id / audio_id / video_id / file_id
-  // tuỳ mime input. Trả về cả id và kind để send build đúng field name.
-  if (meta.image_id) return { id: meta.image_id, kind: 'image' }
-  if (meta.audio_id) return { id: meta.audio_id, kind: 'audio' }
-  if (meta.video_id) return { id: meta.video_id, kind: 'video' }
-  if (meta.file_id)  return { id: meta.file_id,  kind: 'file' }
-  throw new Error('Upload không trả id (image/audio/video/file)')
+  // KHỚP Pancake doUpload (0.5.49): lấy id theo thứ tự fbid → video_id → file_id → gif_id
+  // (+ image_id/audio_id cho VAESA). VAESA TRƯỚC THIẾU `fbid` → upload VIDEO (FB hay trả fbid,
+  // KHÔNG có video_id) bị ném "Upload không trả id" → "Không upload được file nào". Đó là gốc lỗi video.
+  // `kind` suy từ MIME input (fbid generic không cho biết loại) để send build đúng field.
+  const id = meta.fbid || meta.video_id || meta.file_id || meta.gif_id || meta.image_id || meta.audio_id
+  if (!id) throw new Error('Upload không trả id (fbid/video/file/image/audio)')
+  const mt = String(fileMime || '').toLowerCase()
+  let kind = 'file'
+  if (mt.startsWith('image')) kind = 'image'
+  else if (mt.startsWith('video')) kind = 'video'
+  else if (mt.startsWith('audio')) kind = 'audio'
+  return { id, kind }
 }
 
 // ============== GỬI TIN KIỂU PANCAKE (port sendInbox / buildSendParams) ==============
