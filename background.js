@@ -1883,6 +1883,26 @@ async function actionSendText({ pageId, threadId, threadKey, lastMessageMs, body
   return { ok: true, clientUid, payload: r.payload, via: 'pancake' }
 }
 
+// CLONE Pancake buildSendParams: MỖI lần gửi chỉ 1 attachmentType (switch VIDEO/FILE/AUDIO/else=image
+// — loại trừ nhau). Nếu 1 tin trộn nhiều loại (UI hiện không tạo, nhưng phòng sau), ta gửi TUẦN TỰ
+// mỗi loại 1 tin, text đính tin ĐẦU để khỏi lặp. Ca 1 loại (thường gặp) → đúng 1 tin như Pancake.
+async function sendAttachmentsLikePancake({ pageId, clientUid, body, byKind }) {
+  const order = [
+    ['image', 'imageIds'],
+    ['video', 'videoIds'],
+    ['file', 'fileIds'],
+    ['audio', 'audioIds'],
+  ].filter(([k]) => byKind[k] && byKind[k].length)
+  if (!order.length) return await sendViaPancake({ pageId, globalUid: clientUid, text: body })
+  let lastPayload = null
+  for (let i = 0; i < order.length; i++) {
+    const [k, argKey] = order[i]
+    const r = await sendViaPancake({ pageId, globalUid: clientUid, text: i === 0 ? body : '', [argKey]: byKind[k] })
+    lastPayload = r.payload
+  }
+  return { ok: true, payload: lastPayload }
+}
+
 async function actionSendFile({ pageId, threadId, threadKey, lastMessageMs, body, files, globalUid, customerName }) {
   const clientUid = globalUid || await calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs, customerName })
 
@@ -1906,17 +1926,11 @@ async function actionSendFile({ pageId, threadId, threadKey, lastMessageMs, body
   const totalUploaded = byKind.image.length + byKind.audio.length + byKind.video.length + byKind.file.length
   if (!totalUploaded) throw new Error('Không upload được file nào')
 
-  const sendArgs = {
-    pageId, globalUid: clientUid, text: body,
-    imageIds: byKind.image, audioIds: byKind.audio,
-    videoIds: byKind.video, fileIds: byKind.file,
-  }
-
-  // CLONE Pancake: gửi 1 lần qua sendInbox. Lỗi = báo lỗi luôn, KHÔNG gửi lại qua đường cũ.
-  // (Đã GỠ fallback Mercury — nó gửi-lại-khi-báo-lỗi-oan → khách nhận 2 tin/2 ảnh. Pancake không
-  //  có fallback; giờ sendInbox khớp byte nên không cần. Mã 1545012/3252001/1390008 Pancake retry
-  //  qua socket ở WEB APP, không phải gửi lại HTTP ở extension.)
-  const r = await sendViaPancake(sendArgs)
+  // CLONE Pancake: gửi qua sendInbox, 1 attachmentType/tin. Lỗi = báo lỗi luôn, KHÔNG gửi lại đường cũ.
+  // (Đã GỠ fallback Mercury — nó gửi-lại-khi-báo-lỗi-oan → khách nhận 2 tin/2 ảnh. Pancake không có
+  //  fallback; giờ sendInbox khớp byte nên không cần. Mã 1545012/3252001/1390008 Pancake retry qua
+  //  socket ở WEB APP, không phải gửi lại HTTP ở extension.)
+  const r = await sendAttachmentsLikePancake({ pageId, clientUid, body, byKind })
   return { ok: true, clientUid, attachments: byKind, payload: r.payload, via: 'pancake' }
 }
 
@@ -1932,10 +1946,9 @@ async function actionSendPreuploaded({ pageId, threadId, threadKey, lastMessageM
   if (!img.length && !vid.length && !fil.length && !aud.length && !(body && body.trim())) {
     throw new Error('Không có nội dung gửi (preuploaded)')
   }
-  const sendArgs = { pageId, globalUid: clientUid, text: body, imageIds: img, audioIds: aud, videoIds: vid, fileIds: fil }
   const attachments = { image: img, audio: aud, video: vid, file: fil }
-  // CLONE Pancake: gửi 1 lần qua sendInbox. Lỗi = báo lỗi luôn, KHÔNG gửi lại (tránh double-send).
-  const r = await sendViaPancake(sendArgs)
+  // CLONE Pancake: gửi qua sendInbox, 1 attachmentType/tin. Lỗi = báo lỗi luôn (tránh double-send).
+  const r = await sendAttachmentsLikePancake({ pageId, clientUid, body, byKind: attachments })
   return { ok: true, clientUid, attachments, payload: r.payload, via: 'pancake' }
 }
 
