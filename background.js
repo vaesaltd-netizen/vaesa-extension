@@ -73,6 +73,43 @@ chrome.runtime.onInstalled.addListener(_installDnrRules)
 // onInstalled không fire khi service worker chỉ wake lại — gọi luôn để chắc chắn có rule.
 _installDnrRules()
 
+// ============== DNR: Referer ĐÚNG TRANG cho lệnh messaging/send (clone Pancake) ==============
+// Pancake gọi va.set(sendUrl, makeInboxViewUrl(pageId)) trước mỗi send → Referer = URL hộp thư
+// của trang. VAESA trước đây để rule generic set Referer = root → FB chặn 1404132. Rule này
+// priority cao hơn rule generic nên thắng riêng cho /messaging/send. Cache theo pageId (referer
+// chỉ phụ thuộc pageId) → không cập nhật DNR mỗi tin.
+let _sendRefererPageId = null
+const SEND_REFERER_RULE_ID = 9001
+async function setSendReferer(pageId) {
+  if (!pageId || _sendRefererPageId === String(pageId)) return
+  const referer = `https://business.facebook.com/latest/inbox/messenger?asset_id=${encodeURIComponent(pageId)}&nav_ref=diode_page_inbox`
+  try {
+    await chrome.declarativeNetRequest.updateSessionRules({
+      removeRuleIds: [SEND_REFERER_RULE_ID],
+      addRules: [{
+        id: SEND_REFERER_RULE_ID,
+        priority: 100, // > rule generic (default 1) → thắng cho /messaging/send
+        action: {
+          type: 'modifyHeaders',
+          requestHeaders: [
+            { header: 'Referer', operation: 'set', value: referer },
+            { header: 'Origin', operation: 'set', value: 'https://business.facebook.com' },
+          ],
+        },
+        condition: {
+          initiatorDomains: [chrome.runtime.id],
+          urlFilter: '|https://business.facebook.com/messaging/send',
+          resourceTypes: ['xmlhttprequest'],
+        },
+      }],
+    })
+    _sendRefererPageId = String(pageId)
+    console.log('[VAESA Bridge] setSendReferer OK → Referer=inbox page', pageId)
+  } catch (e) {
+    console.warn('[VAESA Bridge] setSendReferer fail:', e?.message || e)
+  }
+}
+
 // ============== FACEBOOK USER: scrape fb_dtsg/lsd/c_user ==============
 // Port từ Retion user.ts
 
@@ -1761,16 +1798,15 @@ async function sendViaPancake({ pageId, globalUid, text, imageIds, audioIds, vid
   const body = Object.keys(params)
     .map(k => encodeURIComponent(k) + '=' + encodeURIComponent(params[k]))
     .join('&')
+  // Clone Pancake: trước khi gửi, đặt Referer của messaging/send = URL HỘP THƯ đúng trang
+  // (makeInboxViewUrl). Pancake làm `va.set(sendUrl, inboxUrl)` trước mỗi send; thiếu bước này
+  // FB anti-abuse coi request không đến từ trang inbox thật → chặn 1404132. (buildHeaders của
+  // Pancake cho endpoint này gần như RỖNG nên KHÔNG kèm x-fb-lsd/x-asbd-id — đã verify source.)
+  await setSendReferer(pageId)
   const res = await fetch('https://business.facebook.com/messaging/send/', {
     method: 'POST',
     credentials: 'include',
-    // Khớp Pancake gốc + các request GraphQL ĐANG CHẠY của VAESA: kèm header anti-abuse FB.
-    // Thiếu x-fb-lsd/x-asbd-id → FB coi request lạ → 1404132 "không dùng được tính năng này".
-    headers: {
-      'content-type': 'application/x-www-form-urlencoded',
-      ...(ctx.lsd ? { 'x-fb-lsd': ctx.lsd } : {}),
-      'x-asbd-id': '359341',
-    },
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body,
   })
   const txt = await res.text()
