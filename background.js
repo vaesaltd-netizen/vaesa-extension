@@ -1604,11 +1604,15 @@ function parseFBResponse(text) {
 // Port từ Retion FacebookPage.#updateOneFile
 
 async function uploadOneFile({ pageId, fileBase64, fileMime, fileName }) {
-  const dtsg = await getDtsg()
+  // Khớp Pancake doUpload (0.5.49): upload URL kèm ĐỦ session params (buildParams: jazoest/__spin/
+  // __hsi/__hs/__rev/dpr/force_blue/__spin_dev_mhenv...), KHÔNG chỉ __a+fb_dtsg. Thiếu jazoest/
+  // session → FB cờ upload VIDEO (nặng, soi kỹ) → trả video_id KHÔNG gửi được → SEND 1404132.
+  // Ảnh nhẹ hơn nên trước đây vẫn lọt với params tối giản; video thì bị chặn.
+  const ctx = await pcGetCtx(pageId)
+  const params = pcBuildParams(ctx)
+  params.request_user_id = pageId
   const url = new URL(FB_UPLOAD_URL)
-  url.searchParams.set('__a', '1')
-  url.searchParams.set('fb_dtsg', dtsg)
-  url.searchParams.set('request_user_id', pageId)
+  Object.keys(params).forEach((k) => { if (params[k] != null) url.searchParams.set(k, String(params[k])) })
 
   // Convert base64 → Blob
   const binaryString = atob(fileBase64)
