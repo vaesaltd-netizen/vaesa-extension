@@ -1708,7 +1708,12 @@ function pcBuildParams(ctx) {
       t.__spin_b = sd.__spin_b
       t.__spin_t = sd.__spin_t
     }
+    // Khớp Pancake buildParams: SiteData["__spin_dev_mhenv"] (key thật, KHÔNG phải __spin_mhenv).
+    if (sd.__spin_dev_mhenv != null) t.__spin_dev_mhenv = sd.__spin_dev_mhenv
   }
+  // Pancake hardcode force_blue=1 (cờ ngữ cảnh Business Suite) — VAESA trước THIẾU → thêm để khớp.
+  // (Bỏ qua __s=webSession.getId() và __ccg vì không nằm trong SiteData, tái tạo sai dễ hại hơn.)
+  t.force_blue = 1
   if (!t.__rev && ctx.client_revision) t.__rev = ctx.client_revision
   if (ctx.dtsg) {
     t.fb_dtsg = ctx.dtsg
