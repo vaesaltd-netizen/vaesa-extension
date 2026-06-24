@@ -1621,7 +1621,11 @@ async function uploadOneFile({ pageId, fileBase64, fileMime, fileName }) {
   const blob = new Blob([bytes], { type: fileMime || 'image/jpeg' })
 
   const formData = new FormData()
-  formData.append('file', blob, fileName || 'image.jpg')
+  // Khớp Pancake doUpload (0.5.49): field upload = `upload_<random 1024-1034>` (KHÔNG phải 'file').
+  // FB mercury phân biệt field này khi xử lý VIDEO → trả video_id gửi được. Field 'file' chỉ lọt
+  // với ảnh; video thì upload trả rỗng ("Không upload được") hoặc video_id không gửi được.
+  const _uploadField = 'upload_' + [1024, 1025, 1026, 1027, 1028, 1029, 1030, 1031, 1032, 1033, 1034][Math.floor(Math.random() * 10)]
+  formData.append(_uploadField, blob, fileName || 'image.jpg')
 
   const res = await fetch(url.toString(), {
     method: 'POST',
