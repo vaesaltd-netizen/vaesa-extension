@@ -1876,19 +1876,11 @@ async function sendViaPancake({ pageId, globalUid, text, imageIds, audioIds, vid
 
 async function actionSendText({ pageId, threadId, threadKey, lastMessageMs, body, globalUid, customerName }) {
   const clientUid = globalUid || await calcGlobalUid({ pageId, threadId, threadKey, lastMessageMs, customerName })
-  // Đường Pancake (port sendInbox) — ưu tiên.
-  try {
-    const r = await sendViaPancake({ pageId, globalUid: clientUid, text: body })
-    return { ok: true, clientUid, payload: r.payload, via: 'pancake' }
-  } catch (e) {
-    console.warn('[VAESA Bridge] Pancake send fail, fallback Mercury cũ:', e?.message || e)
-  }
-  // Fallback: Mercury tối giản cũ (vẫn chạy tốt).
-  const sendBody = await buildSendBody({ pageId, clientUid, text: body })
-  const { text } = await sendFBMessage(sendBody)
-  const parsed = parseFBResponse(text)
-  if (!parsed.ok) throw new Error(parsed.error || 'Gửi thất bại')
-  return { ok: true, clientUid, payload: parsed.payload, via: 'mercury' }
+  // CLONE Pancake: gửi 1 lần qua sendInbox. Lỗi = cannotRetry → báo lỗi luôn, KHÔNG gửi lại.
+  // (Trước có fallback đường Mercury cũ — đã GỠ: nó gửi lại khi sendInbox báo-lỗi-oan-nhưng-đã-giao
+  //  → khách nhận 2 tin. Pancake không có fallback; giờ sendInbox đã khớp byte nên không cần.)
+  const r = await sendViaPancake({ pageId, globalUid: clientUid, text: body })
+  return { ok: true, clientUid, payload: r.payload, via: 'pancake' }
 }
 
 async function actionSendFile({ pageId, threadId, threadKey, lastMessageMs, body, files, globalUid, customerName }) {
@@ -1920,32 +1912,12 @@ async function actionSendFile({ pageId, threadId, threadKey, lastMessageMs, body
     videoIds: byKind.video, fileIds: byKind.file,
   }
 
-  // Đường Pancake — ưu tiên.
-  let pancakeErr = null
-  try {
-    const r = await sendViaPancake(sendArgs)
-    return { ok: true, clientUid, attachments: byKind, payload: r.payload, via: 'pancake' }
-  } catch (e) {
-    pancakeErr = e
-    console.warn('[VAESA Bridge] Pancake send (file) fail, fallback Mercury cũ:', e?.message || e)
-  }
-  // Fallback: Mercury tối giản cũ.
-  let mercuryErr = null
-  try {
-    const sendBody = await buildSendBody({ pageId, clientUid, text: body,
-      imageIds: byKind.image, audioIds: byKind.audio, videoIds: byKind.video, fileIds: byKind.file })
-    const { text } = await sendFBMessage(sendBody)
-    const parsed = parseFBResponse(text)
-    if (!parsed.ok) throw new Error(parsed.error || 'Gửi thất bại')
-    return { ok: true, clientUid, attachments: byKind, payload: parsed.payload, via: 'mercury' }
-  } catch (e) {
-    mercuryErr = e
-  }
-  // ĐÃ GỠ tầng socket/MQTT (2026-06-16): port từ Retion (tự mở WS trong service worker, tự bịa
-  // khung MQTT) SAI kiến trúc → FB trả 502. Đối chiếu source Pancake thật (ext 0.5.48): extension
-  // KHÔNG có code WebSocket/MQTT, cú gửi socket nằm ở web app; và Pancake coi 1545041 là cannotRetry
-  // (chỉ socket cho 1545012/3252001/1390008). → báo lỗi sạch như Pancake.
-  throw mercuryErr || pancakeErr || new Error('Gửi file thất bại')
+  // CLONE Pancake: gửi 1 lần qua sendInbox. Lỗi = báo lỗi luôn, KHÔNG gửi lại qua đường cũ.
+  // (Đã GỠ fallback Mercury — nó gửi-lại-khi-báo-lỗi-oan → khách nhận 2 tin/2 ảnh. Pancake không
+  //  có fallback; giờ sendInbox khớp byte nên không cần. Mã 1545012/3252001/1390008 Pancake retry
+  //  qua socket ở WEB APP, không phải gửi lại HTTP ở extension.)
+  const r = await sendViaPancake(sendArgs)
+  return { ok: true, clientUid, attachments: byKind, payload: r.payload, via: 'pancake' }
 }
 
 // Gửi tin với fb_id ĐÃ có sẵn (web app lấy từ /contents/facebook is_reusable=false) — KHÔNG khiêng
@@ -1962,20 +1934,9 @@ async function actionSendPreuploaded({ pageId, threadId, threadKey, lastMessageM
   }
   const sendArgs = { pageId, globalUid: clientUid, text: body, imageIds: img, audioIds: aud, videoIds: vid, fileIds: fil }
   const attachments = { image: img, audio: aud, video: vid, file: fil }
-  let pancakeErr = null
-  try {
-    const r = await sendViaPancake(sendArgs)
-    return { ok: true, clientUid, attachments, payload: r.payload, via: 'pancake' }
-  } catch (e) {
-    pancakeErr = e
-    console.warn('[VAESA Bridge] Pancake send (preuploaded) fail, fallback Mercury cũ:', e?.message || e)
-  }
-  const sendBody = await buildSendBody({ pageId, clientUid, text: body,
-    imageIds: img, audioIds: aud, videoIds: vid, fileIds: fil })
-  const { text } = await sendFBMessage(sendBody)
-  const parsed = parseFBResponse(text)
-  if (!parsed.ok) throw new Error(parsed.error || pancakeErr?.message || 'Gửi thất bại')
-  return { ok: true, clientUid, attachments, payload: parsed.payload, via: 'mercury' }
+  // CLONE Pancake: gửi 1 lần qua sendInbox. Lỗi = báo lỗi luôn, KHÔNG gửi lại (tránh double-send).
+  const r = await sendViaPancake(sendArgs)
+  return { ok: true, clientUid, attachments, payload: r.payload, via: 'pancake' }
 }
 
 async function actionStatus() {
