@@ -1713,7 +1713,7 @@ function pcBuildSendParams({ pageId, globalUid, text, imageIds, audioIds, videoI
     timestamp: Date.now(),
     request_user_id: pageId,
   }
-  u = Object.assign(u, pcBuildParams(ctx), { __usid: null })
+  u = Object.assign(u, pcBuildParams(ctx)) // bỏ __usid:null (Pancake không gửi __usid → tránh FB cờ request lạ)
   u['specific_to_list[0]'] = 'fbid:' + globalUid
   u['specific_to_list[1]'] = 'fbid:' + pageId
   u.other_user_fbid = globalUid
@@ -1764,7 +1764,13 @@ async function sendViaPancake({ pageId, globalUid, text, imageIds, audioIds, vid
   const res = await fetch('https://business.facebook.com/messaging/send/', {
     method: 'POST',
     credentials: 'include',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    // Khớp Pancake gốc + các request GraphQL ĐANG CHẠY của VAESA: kèm header anti-abuse FB.
+    // Thiếu x-fb-lsd/x-asbd-id → FB coi request lạ → 1404132 "không dùng được tính năng này".
+    headers: {
+      'content-type': 'application/x-www-form-urlencoded',
+      ...(ctx.lsd ? { 'x-fb-lsd': ctx.lsd } : {}),
+      'x-asbd-id': '359341',
+    },
     body,
   })
   const txt = await res.text()
