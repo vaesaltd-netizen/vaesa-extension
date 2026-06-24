@@ -1680,6 +1680,12 @@ function pcParseCtx(html) {
              g(/name="fb_dtsg" value="([^"]+)"/)
   ctx.lsd = g(/"LSD",\[\],\{"token":"([^"]+)"/) || g(/name="lsd" value="([^"]+)"/)
   ctx.client_revision = g(/"client_revision":(\d+)/)
+  // __ccg = WebConnectionClassServerGuess.connectionClass (Pancake buildParams thêm khi có object này).
+  ctx.ccg = g(/"WebConnectionClassServerGuess",\[\],\{[^}]*"connectionClass":"(\w+)"/)
+  // X-MSGR-Region header = MercuryServerRequestsConfig.msgrRegion (Pancake buildHeaders, chỉ cho send).
+  ctx.msgrRegion = g(/"MercuryServerRequestsConfig",\[\],\{[^}]*"msgrRegion":"(\w+)"/) || g(/"msgrRegion":"(\w+)"/)
+  // __s = webSession.getId() — sinh 1 lần per ctx (Pancake tạo webSession 1 lần/Base, cache 1h như ctx).
+  ctx.webSessionId = pcWebSessionId()
   // SprinkleConfig — quyết định cách tính jazoest
   const sp = html.match(/"SprinkleConfig",\[\],\{"param_name":"([^"]+)","version":(\d+),"should_randomize":(true|false)\}/)
   ctx.sprinkle = sp
@@ -1695,6 +1701,20 @@ function pcParseCtx(html) {
     }
   }
   return ctx
+}
+
+// Port webSession.o() — token 6 ký tự base36 từ random. Pancake: floor(wi(ServerNonce)() * 36^6)
+// rồi toString(36) pad 6. `wi` ưu tiên crypto.getRandomValues (service worker LUÔN có) → ServerNonce
+// chỉ là seed dự phòng khi không có crypto → bỏ qua được. Vậy o() = floor(crypto_rand * 36^6) pad6.
+function pcRand6() {
+  const rand = crypto.getRandomValues(new Uint32Array(1))[0] / 4294967296   // [0,1)
+  const n = Math.floor(rand * Math.pow(36, 6))
+  const s = n.toString(36)
+  return '0'.repeat(6 - s.length) + s
+}
+// Port webSession.getId() = s():t():q() — 3 token o() độc lập (session/tab/page), ổn định per phiên.
+function pcWebSessionId() {
+  return pcRand6() + ':' + pcRand6() + ':' + pcRand6()
 }
 
 // Port Base.calcJazoest / calcJazoestV2.
@@ -1716,6 +1736,8 @@ function pcBuildParams(ctx) {
     t.__beoa = sd.be_one_ahead ? 1 : 0
     if (sd.pkg_cohort != null) t.__pc = sd.pkg_cohort
     if (sd.pr != null) t.dpr = sd.pr
+    // Pancake: __ccg = WebConnectionClassServerGuess.connectionClass, ngay sau dpr, chỉ khi parse được.
+    if (ctx.ccg) t.__ccg = ctx.ccg
     t.__rev = sd.client_revision
     if (sd.hsi != null) t.__hsi = sd.hsi
     if (sd.haste_session != null) t.__hs = sd.haste_session
@@ -1729,8 +1751,8 @@ function pcBuildParams(ctx) {
     }
     // Pancake: force_blue CHỈ khi SiteData.force_blue (KHÔNG vô điều kiện như em sửa nhầm trước).
     if (sd.force_blue) t.force_blue = 1
-    // (Pancake còn t.__s = webSession.getId() + __ccg từ WebConnectionClassServerGuess — VAESA
-    //  chưa parse được 2 nguồn này nên bỏ giống Pancake-khi-không-có; KHÔNG bịa giá trị.)
+    // Pancake dòng cuối khối if(SiteData): t.__s = webSession.getId().
+    t.__s = ctx.webSessionId || pcWebSessionId()
   }
   if (!t.__rev && ctx.client_revision) t.__rev = ctx.client_revision
   if (ctx.dtsg) {
@@ -1830,10 +1852,14 @@ async function sendViaPancake({ pageId, globalUid, text, imageIds, audioIds, vid
   // FB anti-abuse coi request không đến từ trang inbox thật → chặn 1404132. (buildHeaders của
   // Pancake cho endpoint này gần như RỖNG nên KHÔNG kèm x-fb-lsd/x-asbd-id — đã verify source.)
   await setSendReferer(pageId)
+  // Pancake sendInbox merge {...buildHeaders(), Content-Type}. buildHeaders = {X-MSGR-Region: msgrRegion}
+  // khi có MercuryServerRequestsConfig (chỉ send mới có header này; doUpload gửi headers rỗng).
+  const sendHeaders = { 'content-type': 'application/x-www-form-urlencoded' }
+  if (ctx.msgrRegion) sendHeaders['X-MSGR-Region'] = ctx.msgrRegion
   const res = await fetch('https://business.facebook.com/messaging/send/', {
     method: 'POST',
     credentials: 'include',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    headers: sendHeaders,
     body,
   })
   const txt = await res.text()
