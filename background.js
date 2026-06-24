@@ -1578,7 +1578,11 @@ async function sendFBMessage(body) {
 
 function parseFBResponse(text) {
   if (!text) return { ok: false, error: 'Empty response' }
-  if (text.includes('"payload":{"error_payload":true}')) return { ok: false, error: 'FB error_payload' }
+  // ❌ TRƯỚC: coi error_payload là FAIL → tin ĐÃ GIAO nhưng báo #10 (user xác nhận 2026-06-24).
+  // ✅ Clone Pancake isResponseSuccess (0.5.49): payload.actions[].message_id HOẶC error_payload
+  //    đều là "đã xử lý xong" → KHÔNG fail oan. error_payload (không kèm errorSummary) rơi xuống
+  //    nhánh JSON.parse bên dưới → có json.payload → ok:true. Lỗi THẬT (1404132) có errorSummary
+  //    → vẫn fail ở nhánh dưới. (Bỏ dòng fail-on-error_payload cũ.)
   if (text.includes('Not Found <br')) return { ok: false, error: 'FB Not Found' }
   if (text.includes('"errorSummary":')) {
     const summary = text.match(/"errorSummary":"([^"]+)"/)?.[1]
