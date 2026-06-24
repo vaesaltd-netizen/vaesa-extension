@@ -633,6 +633,20 @@ function extractBalancedJson(str, start) {
   return null
 }
 
+// Bóc object define của FB: `["<name>",[],{...},N]` → JSON.parse({...}). MIRROR Pancake ctxFromHtml:
+// Pancake `match(/\["Name",\[\],([^\]]+),\d+\]/)` → `runStringFunction("function(){return <obj>}")` (eval).
+// Các define này (SiteData/WebConnectionClassServerGuess/MercuryServerRequestsConfig) là object literal
+// JSON thuần (SiteData VAESA đã JSON.parse được) → JSON.parse tương đương eval, KHÔNG đoán field nằm đâu.
+function pcDefineObject(html, name) {
+  const mark = html.indexOf('"' + name + '",[],')
+  if (mark < 0) return null
+  const brace = html.indexOf('{', mark)
+  if (brace < 0) return null
+  const objStr = extractBalancedJson(html, brace)
+  if (!objStr) return null
+  try { return JSON.parse(objStr) } catch { return null }
+}
+
 // Duyệt đệ quy object đã parse, tìm node bình luận có legacy_fbid/id khớp → trả author.id.
 function findCommentAuthorIdDeep(obj, commentId, depth = 0) {
   if (!obj || typeof obj !== 'object' || depth > 45) return null
@@ -1680,10 +1694,10 @@ function pcParseCtx(html) {
              g(/name="fb_dtsg" value="([^"]+)"/)
   ctx.lsd = g(/"LSD",\[\],\{"token":"([^"]+)"/) || g(/name="lsd" value="([^"]+)"/)
   ctx.client_revision = g(/"client_revision":(\d+)/)
-  // __ccg = WebConnectionClassServerGuess.connectionClass (Pancake buildParams thêm khi có object này).
-  ctx.ccg = g(/"WebConnectionClassServerGuess",\[\],\{[^}]*"connectionClass":"(\w+)"/)
-  // X-MSGR-Region header = MercuryServerRequestsConfig.msgrRegion (Pancake buildHeaders, chỉ cho send).
-  ctx.msgrRegion = g(/"MercuryServerRequestsConfig",\[\],\{[^}]*"msgrRegion":"(\w+)"/) || g(/"msgrRegion":"(\w+)"/)
+  // __ccg = WebConnectionClassServerGuess.connectionClass; X-MSGR-Region = MercuryServerRequestsConfig
+  // .msgrRegion. Bóc CẢ object define (như Pancake) rồi đọc field — KHÔNG regex hẹp đoán field phẳng.
+  ctx.ccg = pcDefineObject(html, 'WebConnectionClassServerGuess')?.connectionClass
+  ctx.msgrRegion = pcDefineObject(html, 'MercuryServerRequestsConfig')?.msgrRegion
   // __s = webSession.getId() — sinh 1 lần per ctx (Pancake tạo webSession 1 lần/Base, cache 1h như ctx).
   ctx.webSessionId = pcWebSessionId()
   // SprinkleConfig — quyết định cách tính jazoest
@@ -1835,7 +1849,10 @@ async function pcGetCtx(pageId, force) {
   if (!ctx.dtsg) throw new Error('Không quét được fb_dtsg từ trang inbox')
   ctx.refererUrl = url
   _pcCtxCache[pageId] = { ctx, ts: Date.now() }
-  console.log(`[VAESA Bridge] pcGetCtx OK page=${pageId} (dtsg+SiteData${ctx.SiteData ? '✓' : '✗'})`)
+  // Log có/không từng field phiên → lần test sau XÁC NHẬN được HTML inbox thật có ccg/msgrRegion không
+  // (thay vì đoán). __s luôn có (tự sinh). Pancake cũng E.log "FOUND lsd"/"FOUND messenger region".
+  console.log(`[VAESA Bridge] pcGetCtx OK page=${pageId} SiteData=${ctx.SiteData ? '✓' : '✗'} `
+    + `ccg=${ctx.ccg || '✗'} msgrRegion=${ctx.msgrRegion || '✗'} lsd=${ctx.lsd ? '✓' : '✗'} __s=${ctx.webSessionId}`)
   return ctx
 }
 
