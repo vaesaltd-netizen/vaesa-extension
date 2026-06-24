@@ -1737,7 +1737,9 @@ function pcBuildParams(ctx) {
     t.fb_dtsg = ctx.dtsg
     t[ctx.sprinkle.param_name] = pcCalcJazoest(ctx.dtsg, ctx.sprinkle)
   }
-  // Pancake buildParams KHÔNG gửi lsd → bỏ (trước VAESA tự thêm = param dư, lệch Pancake).
+  // Pancake buildParams dòng cuối: t.lsd = e.lsd → CÓ gửi lsd. KHÔI PHỤC (em đọc thiếu rồi
+  // xoá nhầm ở commit trước — đây đúng là lỗi "đọc sót rồi suy diễn" anh nhắc).
+  if (ctx.lsd) t.lsd = ctx.lsd
   return t
 }
 
