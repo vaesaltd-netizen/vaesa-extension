@@ -1724,19 +1724,20 @@ function pcBuildParams(ctx) {
       t.__spin_r = sd.__spin_r
       t.__spin_b = sd.__spin_b
       t.__spin_t = sd.__spin_t
+      // Pancake: __spin_dev_mhenv NẰM TRONG khối if(spin), chỉ khi có giá trị.
+      if (sd.__spin_dev_mhenv) t.__spin_dev_mhenv = sd.__spin_dev_mhenv
     }
-    // Khớp Pancake buildParams: SiteData["__spin_dev_mhenv"] (key thật, KHÔNG phải __spin_mhenv).
-    if (sd.__spin_dev_mhenv != null) t.__spin_dev_mhenv = sd.__spin_dev_mhenv
+    // Pancake: force_blue CHỈ khi SiteData.force_blue (KHÔNG vô điều kiện như em sửa nhầm trước).
+    if (sd.force_blue) t.force_blue = 1
+    // (Pancake còn t.__s = webSession.getId() + __ccg từ WebConnectionClassServerGuess — VAESA
+    //  chưa parse được 2 nguồn này nên bỏ giống Pancake-khi-không-có; KHÔNG bịa giá trị.)
   }
-  // Pancake hardcode force_blue=1 (cờ ngữ cảnh Business Suite) — VAESA trước THIẾU → thêm để khớp.
-  // (Bỏ qua __s=webSession.getId() và __ccg vì không nằm trong SiteData, tái tạo sai dễ hại hơn.)
-  t.force_blue = 1
   if (!t.__rev && ctx.client_revision) t.__rev = ctx.client_revision
   if (ctx.dtsg) {
     t.fb_dtsg = ctx.dtsg
     t[ctx.sprinkle.param_name] = pcCalcJazoest(ctx.dtsg, ctx.sprinkle)
   }
-  if (ctx.lsd) t.lsd = ctx.lsd
+  // Pancake buildParams KHÔNG gửi lsd → bỏ (trước VAESA tự thêm = param dư, lệch Pancake).
   return t
 }
 
@@ -1772,7 +1773,9 @@ function pcBuildSendParams({ pageId, globalUid, text, imageIds, audioIds, videoI
     timestamp: Date.now(),
     request_user_id: pageId,
   }
-  u = Object.assign(u, pcBuildParams(ctx)) // bỏ __usid:null (Pancake không gửi __usid → tránh FB cờ request lạ)
+  // Pancake buildSendParams: Object.assign(u, buildParams(), { __usid: generateUsid() }) — và
+  // generateUsid() TRẢ null → Pancake gửi __usid=null. KHÔI PHỤC (trước em xoá nhầm = lệch Pancake).
+  u = Object.assign(u, pcBuildParams(ctx), { __usid: null })
   u['specific_to_list[0]'] = 'fbid:' + globalUid
   u['specific_to_list[1]'] = 'fbid:' + pageId
   u.other_user_fbid = globalUid
