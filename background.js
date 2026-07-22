@@ -25,6 +25,7 @@ const DOC_ID_MESSAGE = '5947328892029037'
 // VAESA backend (Cloudflare Pages Functions + D1) — port kiến trúc Retion `chatbox-merge-v2.botbanhang.vn`
 // nhưng đặt cùng domain với webapp để KH tự host (không phụ thuộc bên thứ 3).
 const VAESA_BE_BASE = 'https://vaesa-livechat.pages.dev/api/fb-uid'
+let vaesaSessionToken = ''
 
 const DTSG_TTL_MS = 30 * 60 * 1000          // 30 phút (Retion dùng 30s, em nâng lên 30 phút cho VAESA real-time)
 const UID_CACHE_TTL_MS = 90 * 24 * 60 * 60 * 1000  // 90 ngày (giống Retion)
@@ -357,13 +358,20 @@ function threadMatchesConv(t, threadId, threadKey) {
 }
 
 // ============== VAESA BACKEND HELPERS ==============
-// Gọi Cloudflare Pages Functions /api/fb-uid/* — port logic Retion REQUEST_SERVER
-// nhưng KHÔNG cần Authorization (BE chấp nhận CORS open + dữ liệu không nhạy cảm).
+// Gọi Cloudflare Pages Functions /api/fb-uid/* — dùng phiên VAESA do content script
+// chuyển từ chính vaesa-livechat.pages.dev. Không nhúng shared secret vào extension.
+
+function beHeaders(extra = {}) {
+  return {
+    ...extra,
+    ...(vaesaSessionToken ? { 'x-vaesa-session': vaesaSessionToken } : {}),
+  }
+}
 
 async function beGet(path, params = {}) {
   const url = new URL(`${VAESA_BE_BASE}/${path}`)
   for (const k of Object.keys(params)) url.searchParams.set(k, params[k])
-  const res = await fetch(url.toString(), { method: 'GET' })
+  const res = await fetch(url.toString(), { method: 'GET', headers: beHeaders() })
   if (!res.ok) throw new Error(`BE ${path} HTTP ${res.status}`)
   return await res.json()
 }
@@ -371,7 +379,7 @@ async function beGet(path, params = {}) {
 async function bePost(path, body) {
   const res = await fetch(`${VAESA_BE_BASE}/${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: beHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(body),
   })
   if (!res.ok) throw new Error(`BE ${path} HTTP ${res.status}`)
@@ -2239,6 +2247,11 @@ chrome.runtime.onInstalled.addListener(async () => {
 
 chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   console.log('[VAESA Bridge] msg in:', req?.action)
+  // Chỉ nhận session do content script của đúng webapp chuyển sang. Service worker có thể
+  // bị Chrome dừng/rồi chạy lại; mỗi message từ webapp sẽ nạp lại token hiện hành.
+  if (sender?.url?.startsWith('https://vaesa-livechat.pages.dev/')) {
+    vaesaSessionToken = String(req?.vaesaSession || '')
+  }
   const dispatch = async () => {
     switch (req?.action) {
       case 'VAESA_PING':

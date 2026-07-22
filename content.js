@@ -8,6 +8,10 @@
 
 const EXT_VERSION = chrome.runtime.getManifest().version
 
+function getVaesaSession() {
+  try { return localStorage.getItem('vaesa.session_token') || '' } catch { return '' }
+}
+
 // Announce ext installed cho webapp tự detect
 window.postMessage({ source: 'vaesa-ext', action: 'INSTALLED', version: EXT_VERSION }, '*')
 
@@ -76,7 +80,11 @@ window.addEventListener('message', (e) => {
   }
 
   try {
-    chrome.runtime.sendMessage({ action: bgAction, payload: msg.payload }, (r) => {
+    chrome.runtime.sendMessage({
+      action: bgAction,
+      payload: msg.payload,
+      vaesaSession: getVaesaSession(),
+    }, (r) => {
       const lastErr = chrome.runtime.lastError
       if (lastErr) return respond({ ok: false, error: 'BG err: ' + lastErr.message })
       respond(r || { ok: false, error: 'BG returned undefined' })
