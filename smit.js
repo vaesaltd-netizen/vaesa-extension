@@ -319,5 +319,91 @@ async function fetchSpend({ ids = [], preset = null, since = null, until = null 
   return out
 }
 
-self.vaesaSmit = { fetchAdAccounts, fetchHiddenLimit, fetchSpend }
+// ── Công cụ (Kho chức năng) — chép SMIT 1128.52251f38.js ───────────────────────────────────────────────────────────
+// GraphQL theo phiên đăng nhập (SMIT 14845 w(): locale en_US, __a=1, x-asbd-id, đọc dòng đầu; www báo 1675002 → business).
+async function graphql(host, payload) {
+  const token = await getAdsToken()
+  const goi = async (h) => {
+    const body = new URLSearchParams({ locale: 'en_US', __a: '1', ...payload, fb_dtsg: token.fb_dtsg || '', lsd: token.lsd || '' })
+    const hdr = { 'content-type': 'application/x-www-form-urlencoded', 'x-asbd-id': '1' }
+    if (payload.fb_api_req_friendly_name) hdr['x-fb-friendly-name'] = payload.fb_api_req_friendly_name
+    const res = await fetch(`https://${h}.facebook.com/api/graphql/`, { method: 'POST', credentials: 'include', headers: hdr, body: body.toString() })
+    let t = await res.text()
+    if (t.startsWith('for (;;);')) t = t.slice(9)
+    const dong = t.includes('\n') ? (t.split('\n')[0] || '').trim() : t
+    try { return { json: JSON.parse(dong), raw: t } } catch { return { json: null, raw: t } }
+  }
+  let r = await goi(host)
+  if (host === 'www' && (r.json?.errors?.[0]?.code === 1675002 || r.json?.error === 1675002)) r = await goi('business')
+  // Câu lỗi như SMIT 14845: description_raw → description → summary → message (FB trả tiếng Việt theo tài khoản).
+  const e0 = r.json?.errors?.[0]
+  const loi = (e0 && [e0.description_raw, e0.description, e0.summary, e0.message].find((x) => typeof x === 'string' && x.trim()))
+    || r.json?.errorSummary || (r.json?.error ? r.json?.errorDescription || String(r.json.error) : null)
+  return { ...r, loi: loi ? String(loi) : null }
+}
+
+// Graph POST /act_X (SMIT 14845 JB, tokenPurpose powerEditorAction) — mã EAAB adsmanager, kèm cookie.
+async function graphPost(path, params) {
+  const token = await getAdsToken()
+  const res = await fetch(`${GRAPH}/${path}`, {
+    method: 'POST', credentials: 'include',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ ...params, access_token: token.access_token }).toString(),
+  })
+  const j = await res.json().catch(() => null)
+  return j?.error ? { loi: String(j.error.error_user_msg || j.error.message || 'Graph lỗi'), j } : { j }
+}
+const boAct = (id) => String(id || '').replace(/^act_/, '')
+
+// Mở/Đóng TKQC — SMIT eS (đóng: BizKitSettingsDeactivateAdAccountMutation @business) / eA (mở: useBillingReactivateAdAccountMutation @adsmanager).
+async function openCloseAccount({ id, mode }) {
+  const acc = boAct(id)
+  if (mode !== 'open' && mode !== 'close') return { ok: false, message: 'Mode không hợp lệ (phải là open hoặc close)' }
+  if (!acc) return { ok: false, message: 'Thiếu ID tài khoản' }
+  if (mode === 'close') {
+    const r = await graphql('business', { fb_api_req_friendly_name: 'BizKitSettingsDeactivateAdAccountMutation', doc_id: '9895135750555877', variables: JSON.stringify({ adAccountID: acc }) })
+    if (r.loi) return { ok: false, message: r.loi }
+    return r.json?.data?.business_settings_deactivate_ad_account
+      ? { ok: true, message: 'Đã đóng tài khoản (GraphQL)', patch: { account_status: 101 } }
+      : { ok: false, message: 'GraphQL không xác nhận được đóng tài khoản' }
+  }
+  const tk = await getAdsToken()
+  const r = await graphql('adsmanager', {
+    fb_api_req_friendly_name: 'useBillingReactivateAdAccountMutation', doc_id: '9984888131552276',
+    variables: JSON.stringify({ input: { billable_account_payment_legacy_account_id: acc, actor_id: tk.user_id, client_mutation_id: '1', logging_data: {}, upl_logging_data: { wizard_name: 'REACTIVATE_AD_ACCOUNT' } } }),
+  })
+  if (r.loi) return { ok: false, message: r.loi }
+  // SMIT kR(n, "ADMARKET_ACCOUNT_STATUS_ACTIVE"): câu trả lời có chuỗi trạng thái hoạt động.
+  return String(r.raw || '').includes('ADMARKET_ACCOUNT_STATUS_ACTIVE')
+    ? { ok: true, message: 'Đã mở tài khoản (GraphQL)', patch: { account_status: 1 } }
+    : { ok: false, message: 'GraphQL không xác nhận được mở tài khoản' }
+}
+
+// Đặt giới hạn chi tiêu — SMIT 83831: set (spend_cap) / remove (spend_cap_action=delete) / reset (GraphQL 5205066939546485 @www).
+// amount đã là tiền CỦA TKQC (web quy đổi trước như SMIT 3732).
+async function spendLimit({ id, mode, amount }) {
+  const acc = boAct(id)
+  if (!['set', 'remove', 'reset'].includes(mode)) return { ok: false, message: 'Mode không hợp lệ (phải là set, remove, hoặc reset)' }
+  if (!acc) return { ok: false, message: 'Thiếu ID tài khoản' }
+  if (mode === 'set') {
+    const so = Number(amount)
+    if (!Number.isFinite(so) || so <= 0) return { ok: false, message: 'Số tiền giới hạn phải là số dương' }
+    const r = await graphPost(`act_${acc}`, { spend_cap: String(so) })
+    if (r.loi) return { ok: false, message: r.loi }
+    return r.j?.success === true ? { ok: true, message: `Đã đặt giới hạn chi tiêu: ${so}`, patch: { spend_cap_don_vi: so } } : { ok: false, message: 'Graph không xác nhận được đặt giới hạn chi tiêu' }
+  }
+  if (mode === 'remove') {
+    const r = await graphPost(`act_${acc}`, { spend_cap_action: 'delete' })
+    if (r.loi) return { ok: false, message: r.loi }
+    return r.j?.success === true ? { ok: true, message: 'Đã gỡ giới hạn chi tiêu', patch: { spend_cap: '0' } } : { ok: false, message: 'Graph không xác nhận được gỡ giới hạn chi tiêu' }
+  }
+  const tk = await getAdsToken()
+  const r = await graphql('www', { doc_id: '5205066939546485', variables: JSON.stringify({ input: { billable_account_payment_legacy_account_id: acc, actor_id: tk.user_id, client_mutation_id: '1' } }) })
+  if (r.loi) return { ok: false, message: r.loi }
+  return r.json?.data?.billable_account_reset_spend_limit?.billable_account?.spending_info
+    ? { ok: true, message: 'Đã reset số tiền đã chi về 0', patch: { amount_spent: '0' } }
+    : { ok: false, message: 'GraphQL không xác nhận được reset số đã chi' }
+}
+
+self.vaesaSmit = { fetchAdAccounts, fetchHiddenLimit, fetchSpend, openCloseAccount, spendLimit }
 })()

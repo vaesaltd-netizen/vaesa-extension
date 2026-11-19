@@ -2446,6 +2446,11 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         const r = await self.vaesaSmit.fetchAdAccounts({ payment: q.payment !== false, source: q.source, tkqcIds: q.tkqcIds, bmIds: q.bmIds, accountType: q.accountType })
         return { ok: true, accounts: r.accounts, user: r.token }
       }
+      // Công cụ màn Smit — ĐỔI THẬT trên Facebook, chỉ chạy khi người dùng bấm "Chạy".
+      case 'VAESA_FB_OPEN_CLOSE':
+        return await self.vaesaSmit.openCloseAccount(req.payload || {})
+      case 'VAESA_FB_SPEND_LIMIT':
+        return await self.vaesaSmit.spendLimit(req.payload || {})
       case 'VAESA_FB_SPEND': {
         const q = req.payload || {}
         return { ok: true, spend: await self.vaesaSmit.fetchSpend({ ids: q.ids || [], preset: q.preset, since: q.since, until: q.until }) }
