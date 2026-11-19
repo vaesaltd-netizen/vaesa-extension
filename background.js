@@ -2441,8 +2441,13 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         return await actionCrawlMbs(req.payload || {})
       // ── Màn Smit: danh sách TKQC ──
       case 'VAESA_FB_ADACCOUNTS': {
-        const r = await self.vaesaSmit.fetchAdAccounts({ payment: req.payload?.payment !== false })
+        const q = req.payload || {}
+        const r = await self.vaesaSmit.fetchAdAccounts({ payment: q.payment !== false, source: q.source, tkqcIds: q.tkqcIds, bmIds: q.bmIds, accountType: q.accountType })
         return { ok: true, accounts: r.accounts, user: r.token }
+      }
+      case 'VAESA_FB_SPEND': {
+        const q = req.payload || {}
+        return { ok: true, spend: await self.vaesaSmit.fetchSpend({ ids: q.ids || [], preset: q.preset, since: q.since, until: q.until }) }
       }
       case 'VAESA_FB_HIDDEN_LIMIT': {
         const id = req.payload?.asset_id

@@ -66,7 +66,7 @@ async function getAdsToken(force = false) {
 // Gọi Graph REST, tự phân trang theo paging.next.
 async function graphGet(path, params, accessToken) {
   const out = []
-  let url = `${GRAPH}/${path}?${new URLSearchParams({ ...params, access_token: accessToken }).toString()}`
+  let url = `${GRAPH}/${path || ''}?${new URLSearchParams({ ...params, access_token: accessToken }).toString()}`
   for (let guard = 0; guard < 50 && url; guard++) {
     // Mã EAAB lấy từ adsmanager gắn với phiên đăng nhập → PHẢI kèm cookie, bỏ cookie FB trả "Invalid request" (đo 19/11).
     const res = await fetch(url, { credentials: 'include' })
@@ -173,10 +173,50 @@ function mapAccount(acc, myUserId) {
 
 // PUBLIC: lấy toàn bộ TKQC — của chính user + mọi BM user có quyền.
 // Trả { accounts: [...], token: {user_id, user_name} }. Limit ẩn KHÔNG lấy ở đây (gọi riêng khi cần).
-async function fetchAdAccounts({ payment = true } = {}) {
+// Tách danh sách ID người dùng dán — SMIT: "mỗi ID cách nhau bằng dấu xuống dòng, tab hoặc dấu chấm phẩy";
+// giữ phần số ≥ 5 chữ số (SMIT 1927 hàm c()), bỏ "act_".
+function tachId(txt) {
+  return [...new Set(String(txt || '').split(/[\n\t;,]+/).map((x) => x.trim().replace(/^act_/, '')).filter((x) => /^\d{5,}$/.test(x)))]
+}
+
+// Gọi nhiều đối tượng 1 lần: GET /?ids=a,b,c&fields=… (tối đa 50 id/lượt).
+async function graphIds(ids, fields, accessToken) {
+  const out = {}
+  for (let i = 0; i < ids.length; i += 50) {
+    const part = ids.slice(i, i + 50)
+    const r = await graphGet('', { ids: part.join(','), fields }, accessToken)
+    // Gửi kèm cookie thì FB trả thêm khoá __fb_trace_id__/__www_request_id__ — chỉ giữ đúng id đã hỏi.
+    for (const id of part) if (r?.[id]) out[id] = r[id]
+  }
+  return out
+}
+
+// cfg (hộp "Cấu hình tải dữ liệu TKQC" của SMIT, 1628.371c0067.js): source all|tkqcIds|bmIds,
+// tkqcIds/bmIds = chuỗi dán, accountType all|personal|bm.
+async function fetchAdAccounts({ payment = true, source = 'all', tkqcIds = '', bmIds = '', accountType = 'all' } = {}) {
   let token = await getAdsToken()
   const fields = buildFields({ payment })
   const run = async () => {
+    if (source === 'tkqcIds') {
+      const ids = tachId(tkqcIds)
+      if (!ids.length) throw new Error('Chưa nhập ID TKQC')
+      const r = await graphIds(ids.map((x) => `act_${x}`), fields, token.access_token)
+      return Object.values(r).filter((a) => a && !a.error)
+    }
+    if (source === 'bmIds') {
+      const ids = tachId(bmIds)
+      if (!ids.length) throw new Error('Chưa nhập ID BM')
+      const byId = new Map()
+      for (const b of ids) {
+        for (const edge of ['owned_ad_accounts', 'client_ad_accounts']) {
+          try {
+            const r = await graphGet(`${b}/${edge}`, { fields, limit: PAGE_LIMIT }, token.access_token)
+            for (const a of r.data || []) { const k = a.account_id || a.id; if (!byId.has(k)) byId.set(k, a) }
+          } catch (e) { /* BM lẻ lỗi quyền — bỏ qua */ }
+        }
+      }
+      return [...byId.values()]
+    }
     // 1) TKQC cá nhân của user.
     const me = await graphGet('me/adaccounts', { fields, limit: PAGE_LIMIT }, token.access_token)
     // 2) Danh sách BM user có vai trò → owned + client ad accounts.
@@ -203,6 +243,9 @@ async function fetchAdAccounts({ payment = true } = {}) {
   } catch (e) {
     if (String(e.message).includes('hết hạn')) { token = await getAdsToken(true); raw = await run() } else throw e
   }
+  // Loại tài khoản — SMIT 37508 hàm f(): personal = không có owner_business, bm = có.
+  if (accountType === 'personal') raw = raw.filter((a) => !a.owner_business?.id)
+  else if (accountType === 'bm') raw = raw.filter((a) => !!a.owner_business?.id)
   return {
     accounts: raw.map((a) => {
       const row = mapAccount(a, token.user_id)
@@ -258,5 +301,23 @@ async function fetchHiddenLimit(assetId, currency) {
   return { limit: Number.isFinite(so) ? so : null, currency: cur }
 }
 
-self.vaesaSmit = { fetchAdAccounts, fetchHiddenLimit }
+async function fetchSpend({ ids = [], preset = null, since = null, until = null } = {}) {
+  const token = await getAdsToken()
+  const PRESETS = new Set(['today', 'yesterday', 'last_7d', 'last_30d', 'this_month', 'last_month'])
+  const coPreset = PRESETS.has(preset)
+  const ins = coPreset ? `insights.date_preset(${preset}){spend,date_start,date_stop}`
+    : since && until ? `insights.time_range({since: '${since}',until:'${until}'}){spend,date_stop}`
+      : 'insights.date_preset(lifetime){spend,date_stop}'
+  const kemHomNay = !coPreset || preset === 'this_month'
+  const fields = ['account_id', ins, ...(kemHomNay ? ['insights.date_preset(today).as(today_spend){spend,date_start}'] : [])].join(',')
+  const r = await graphIds(ids.map((x) => `act_${String(x).replace(/^act_/, '')}`), fields, token.access_token)
+  const out = {}
+  for (const [k, v] of Object.entries(r)) {
+    if (!v || v.error) continue
+    out[k.replace(/^act_/, '')] = { insights: v.insights?.data?.[0] || null, today: v.today_spend?.data?.[0] || null }
+  }
+  return out
+}
+
+self.vaesaSmit = { fetchAdAccounts, fetchHiddenLimit, fetchSpend }
 })()
