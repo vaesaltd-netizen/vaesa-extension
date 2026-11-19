@@ -37,6 +37,8 @@ function parseAdsTokens(html) {
   if (m) t.fb_dtsg = m[1]
   m = html.match(/"LSD",\[\],\{"token":"([^"]+)"/)
   if (m) t.lsd = m[1]
+  m = html.match(/"DTSGInitData".*?"token":"(.*?)","async_get_token":"(.*?)"/) // mã fb_dtsg_ag cho /me/signals (tab Pixel cách 2)
+  if (m?.[2]) t.fb_dtsg_ag = m[2]
   m = html.match(/"USER_ID":"(\d+)"/)
   if (m) t.user_id = m[1]
   m = html.match(/"NAME":"([^"]*)"/)
@@ -1391,6 +1393,127 @@ async function pageKiemTien() { // eh(): creator_monetization eligibility_widget
   return { ok: true, byId }
 }
 
+// ── Tab Pixel (SMIT 6747 module 61745 / 94633 / 42600 / 98657, 1128 module 24184) — ≥ 3.12.36. Trang điều phối như 6193 n5
+// (cách 1 Graph theo lô BM, cách 2 /me/signals, tự thử cách còn lại cho BM chưa có Pixel); tiện ích chỉ làm lệnh ĐỌC ngắn.
+const truongPixel = (n) => `owned_pixels.limit(${n}){id,name,last_fired_time,owner_business,is_unavailable},client_pixels.limit(${n}){id,name,last_fired_time,owner_business,is_unavailable}` // s()
+const dongPixelGraph = (e) => (e.id ? { id: e.id, name: e.name, last_fired_time: e.last_fired_time, is_unavailable: e.is_unavailable, owner_business: e.owner_business, business: e.business, is_new: false } : null) // d()
+async function pixelBmDs() { // 61745 k(): /me/businesses id,name 100/lượt theo "after", tối đa 50 lượt; lỗi ⇒ dừng, giữ phần đã đọc
+  const m = new Map(), daQua = new Set()
+  let sau = ''
+  for (let i = 0; i < 50; i += 1) {
+    if (sau && daQua.has(sau)) break
+    if (sau) daQua.add(sau)
+    const params = { fields: 'id,name', limit: '100', ...(sau ? { after: sau } : {}) }
+    const r = await jbGoi('/me/businesses', { params })
+    if (r.error) break
+    for (const e of r.data ?? []) if (e.id && !m.has(e.id)) m.set(e.id, { id: e.id, name: e.name ?? '' })
+    const u = r.paging?.next
+    if (!u) break
+    sau = new URL(u).searchParams.get('after') ?? ''
+    if (!sau) break
+  }
+  return { ok: true, items: [...m.values()] }
+}
+async function pixelRoles() { // 94633 N(): /me/business_users role,business{id} 100/lượt v25.0 theo paging.next, tối đa 50; lỗi ⇒ dừng
+  const out = {}
+  let a = '/me/business_users'
+  for (let i = 0; i < 50 && a; i += 1) {
+    const r = await jbGoi(a, a.startsWith('https') ? {} : { version: 'v25.0', params: { fields: 'role,business{id}', limit: '100' } })
+    if (r.error) break
+    for (const e of r.data ?? []) { const id = e.business?.id; if (id && e.role) out[id] = e.role }
+    a = r.paging?.next ?? null
+  }
+  return { ok: true, roles: out }
+}
+async function docTiepPixel(canh) { // l(): đọc tiếp theo paging.next, tối đa 50 lượt; lỗi ⇒ ném
+  const ra = [...(canh?.data ?? [])], daQua = new Set()
+  let next = canh?.paging?.next
+  for (let e = 0; e < 50 && next; e += 1) {
+    if (daQua.has(next)) break
+    daQua.add(next)
+    const r = await jbGoi(next)
+    if (r.error) throw new Error(r.message)
+    ra.push(...(r.data ?? []))
+    next = r.paging?.next
+  }
+  return ra
+}
+async function pixelGraph({ bmIds, limit = 100 }) { // 42600 p(): lô ≤ 50 BM qua Graph batch v24.0
+  const ds = (bmIds || []).map(String).slice(0, 50)
+  const reqs = ds.map((id) => ({ method: 'GET', relative_url: `${id}?fields=${encodeURIComponent(truongPixel(limit))}` }))
+  const c = await jbGoi('', { method: 'POST', body: { include_headers: 'false', batch: JSON.stringify(reqs) } })
+  if (c?.error) return { ok: false, message: c.message, code: c.code }
+  if (!Array.isArray(c)) return { ok: false, message: 'Phản hồi batch tải Pixel không phải mảng.' }
+  if (c.length !== reqs.length) return { ok: false, message: 'Batch tải Pixel trả về thiếu kết quả so với số BM đã hỏi.' }
+  const items = []
+  for (let i = 0; i < ds.length; i += 1) {
+    const bmId = ds[i], it = c[i]
+    let k
+    if (!it) k = { ok: false, message: 'Facebook không trả kết quả tải Pixel cho BM này.' }
+    else {
+      let t, hong = false
+      try { t = JSON.parse(it.body ?? '') } catch { hong = true }
+      if (hong) k = { ok: false, message: 'Phản hồi tải Pixel không hợp lệ cho BM này.' }
+      else if (t.error) k = { ok: false, message: t.error.message ?? 'Facebook từ chối tải Pixel của BM này.' }
+      else if (it.code !== undefined && it.code >= 400) k = { ok: false, message: `Facebook trả lỗi ${it.code} khi tải Pixel của BM này.` }
+      else k = { ok: true, node: t }
+    }
+    if (!k.ok) { items.push({ bmId, ok: false, message: k.message }); continue }
+    try {
+      const [a, b] = await Promise.all([docTiepPixel(k.node.owned_pixels), docTiepPixel(k.node.client_pixels)])
+      const m = new Map()
+      for (const e of [...a, ...b]) { const d = dongPixelGraph(e); if (d) m.set(d.id, d) }
+      items.push({ bmId, ok: true, pixels: [...m.values()] })
+    } catch (e) { items.push({ bmId, ok: false, message: (e instanceof Error ? e : new Error(String(e))).message }) }
+  }
+  return { ok: true, items }
+}
+async function pixelSignals({ bmId }) { // 98657 a(): business.facebook.com/me/signals (fb_dtsg_ag), con trỏ tới "COMPLETED", nghỉ 300 ms, tối đa 50 trang
+  const tk = await getAdsToken()
+  if (!tk.fb_dtsg_ag) return { ok: true, rows: null }
+  const l = [], daQua = new Set()
+  let d = ''
+  for (let n = 0; n < 50; n += 1) {
+    if (d && daQua.has(d)) break
+    if (d) daQua.add(d)
+    const url = `https://business.facebook.com/me/signals/?data_source_type=ALL&business_id=${encodeURIComponent(bmId)}&fb_dtsg_ag=${encodeURIComponent(tk.fb_dtsg_ag)}` + (d ? `&pixel_cursor_key=${encodeURIComponent(d)}` : '') + '&__a=1'
+    let p = null
+    try {
+      const t = await (await fetch(url, { credentials: 'include' })).text()
+      const b = t.startsWith('for (;;);') ? t.slice(9) : t
+      p = JSON.parse(b.includes('\n') ? (b.split('\n')[0] || '').trim() : b)
+    } catch { p = null }
+    const f = p?.payload
+    if (!f || !Array.isArray(f.data_sources)) { if (n === 0) return { ok: true, rows: null }; break }
+    l.push(...f.data_sources)
+    const m = f.pixel_cursor_key
+    if (!m || m === 'COMPLETED') break
+    d = m
+    await ngu(300)
+  }
+  const m = new Map()
+  for (const e of l) if (e?.id) m.set(e.id, { id: e.id, name: e.name, data_source_type: e.data_source_type, last_fired_time: e.last_fired_time, business: e.business ? { id: e.business.id, name: e.business.name } : undefined })
+  return { ok: true, rows: [...m.values()] }
+}
+async function canhPixel(id, canh, bmId) { // 24184 i(): {canh}.limit(100).business(bm)[.after(c)]{account_id,name,id}, tối đa 50 lượt; lỗi ⇒ ném
+  const s = []
+  let o = ''
+  for (let l = 0; l < 50; l += 1) {
+    const duoi = o ? `.limit(100).business(${bmId}).after(${o})` : `.limit(100).business(${bmId})`
+    const u = await jbGoi(`/${id}`, { params: { fields: `${canh}${duoi}{account_id,name,id}` } })
+    if (u.error) throw new Error(u.message)
+    const c = u[canh]
+    for (const e of Array.isArray(c) ? c : c?.data ?? []) s.push({ id: String(e.id ?? e.account_id ?? ''), name: e.name, account_id: e.account_id })
+    o = !c || Array.isArray(c) ? '' : c.paging?.next ? c.paging.cursors?.after ?? '' : ''
+    if (!o) break
+  }
+  return s
+}
+async function pixelNguoi({ id, bmId }) { // li(): ba cạnh song song — người dùng / đối tác / TKQC; cạnh lỗi ⇒ null
+  const [people, partner, adaccount] = await Promise.all([canhPixel(id, 'assigned_users', bmId).catch(() => null), canhPixel(id, 'assigned_partners', bmId).catch(() => null), canhPixel(id, 'permissible_ad_accounts', bmId).catch(() => null)])
+  return { ok: true, people, partner, adaccount }
+}
+
 // VIA của trình duyệt này (500:343-363 v()): Graph /me id,name,picture.width(100){url} bằng mã đọc — tab VIA (≥ 3.12.33).
 async function viaMe() {
   const e = await jbGoi('/me', { params: { fields: 'id,name,picture.width(100){url}' } })
@@ -1474,7 +1597,8 @@ const CONG_CU = { 'check-hold': checkHold, 'check-location-verification': checkL
   'import-campaign-xlsx': importXlsx, 'boost-gql': boostGql, 'boost-session': boostSession, 'boost-me-pages': boostMePages,
   'boost-currency': boostCurrency, 'boost-page-posts': boostPagePosts, 'boost-publish': boostPublish, 'via-me': viaMe,
   'bm-list': bmList, 'bm-roles': bmRoles, 'bm-chi-tiet': bmChiTiet, 'bm-admin-an': bmAdminAn, 'bm-trang-thai': bmTrangThai, 'bm-loai': bmLoai, 'bm-khang': bmKhang,
-  'page-mine': pageMine, 'page-bm-ds': pageBmDs, 'page-bm-quet': pageBmQuet, 'page-lo': pageLo, 'page-roles': pageRoles, 'page-dem-bai': pageDemBai, 'page-live': pageLive, 'page-kiem-tien': pageKiemTien }
+  'page-mine': pageMine, 'page-bm-ds': pageBmDs, 'page-bm-quet': pageBmQuet, 'page-lo': pageLo, 'page-roles': pageRoles, 'page-dem-bai': pageDemBai, 'page-live': pageLive, 'page-kiem-tien': pageKiemTien,
+  'pixel-bm-ds': pixelBmDs, 'pixel-roles': pixelRoles, 'pixel-graph': pixelGraph, 'pixel-signals': pixelSignals, 'pixel-nguoi': pixelNguoi }
 async function runTool(fn, payload) {
   const f = CONG_CU[fn]
   if (!f) return { ok: false, message: `Tiện ích chưa có chức năng ${fn} — cập nhật VAESA Extension` }
