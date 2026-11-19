@@ -649,7 +649,7 @@ const loiPhien = (r) => r?.error && ([190, 102, 463, 467, 1357004].includes(r.co
 async function goiGraphql(host, form, opt = {}) {
   const chay = async (token) => {
     const goi = async (h) => {
-      const body = new URLSearchParams({ locale: 'en_US', __a: '1', ...form, fb_dtsg: token.fb_dtsg || '', lsd: token.lsd || '', ...(opt.them || {}) })
+      const body = new URLSearchParams({ locale: 'en_US', __a: '1', ...form, fb_dtsg: token.fb_dtsg || '', lsd: token.lsd || '', ...(typeof opt.them === 'function' ? opt.them(token) : opt.them || {}) })
       const res = await fetch(`https://${h}.facebook.com/api/graphql/`, { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-asbd-id': '1' }, body: body.toString() })
       return docGraphql(await res.text(), opt)
     }
@@ -1514,6 +1514,258 @@ async function pixelNguoi({ id, bmId }) { // li(): ba cạnh song song — ngư�
   return { ok: true, people, partner, adaccount }
 }
 
+// ── Kho chức năng tab BM (SMIT 1128 module 77061 runner BM + 86817 kích hoạt Page + 21509 WABA; docs/modules/smit/cong-cu-bm.md,
+// cong-cu-bm-waba-page.md) — ≥ 3.12.37. Trang điều phối như SMIT (từng BM, từng mục, nghỉ 1–3 s giữa các mục — td); mỗi lệnh dưới đây
+// chỉ gửi MỘT thao tác. Lỗi phiên ném ra ở chỗ SMIT không bắt (gf() hỏng ngoài try) ⇒ { nem: true } để trang coi như cả bước lỗi.
+const bmBoc = (f) => async (p) => { try { return await f(p || {}) } catch (e) { return { ok: false, nem: true, message: String(e?.message || e) } } }
+const KY_TU_EMAIL = 'abcdefghijklmnopqrstuvwxyz0123456789'
+const emailBm = () => `via_${Date.now()}_${Array.from({ length: 6 }, () => KY_TU_EMAIL[Math.floor(36 * Math.random())]).join('')}@gmail.com` // S()
+const gqlBm = (form, them) => goiGraphql('business', form, them ? { them } : {})
+const relayBm = (them = {}) => (t) => ({ __comet_req: '1', fb_api_caller_class: 'RelayModern', jazoest: jazoest(t.fb_dtsg || ''), ...them }) // UG relayFields
+const thuLoi = async (f) => { try { return await f() } catch (e) { return { ok: false, message: String(e?.message || e) } } }
+
+// create-bm (11599-11725): 350 / 50 qua E() (không bắt lỗi ném), bm1 thử 2 lần (có bắt), "over" = business/create_account.
+const CAU_HINH_TAO_BM = { 350: { doc: '5232196050177866', ten: 'FBEGeoBMCreation_CreateBusinessMutation', seed: false }, 50: { doc: '7183377418404152', seed: true, source: 'MBS_BUSINESS_CREATION_PROMINENT_HOME_CARD' } }
+const TAO_BM1 = { doc: '7780408488685584', seed: true, source: 'BM_HOME_BUSINESS_CREATION_IN_SCOPE_SELECTOR', entry: 'UNIFIED_GLOBAL_SCOPE_SELECTOR' }
+async function taoBmGql(name, c) { // E()
+  const { user_id } = await getAdsToken()
+  const input = { client_mutation_id: '1', actor_id: user_id, business_name: name }
+  if (c.seed) Object.assign(input, { user_first_name: name, user_last_name: name, user_email: emailBm() })
+  if (c.source) input.creation_source = c.source
+  if (c.entry) input.entry_point = c.entry
+  const r = await gqlBm({ ...(c.ten ? { fb_api_req_friendly_name: c.ten } : {}), doc_id: c.doc, variables: JSON.stringify({ input }) })
+  return r.error ? { ok: false, message: r.message } : { ok: true, message: `Đã tạo BM "${name}"` }
+}
+async function taoBmCong(name) { // A()
+  return thuLoi(async () => {
+    const t = await getAdsToken()
+    const q = new URLSearchParams({ brand_name: name, first_name: name, last_name: name, email: emailBm(), timezone_id: '132', business_category: 'OTHER' })
+    const body = new URLSearchParams({ __user: t.user_id, __a: '1', fb_dtsg: t.fb_dtsg, jazoest: jazoest(t.fb_dtsg || ''), lsd: t.lsd }).toString()
+    const s = await (await fetch(`https://business.facebook.com/business/create_account/?${q}`, { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body })).text()
+    const l = JSON.parse(s.startsWith('for (;;);') ? s.slice(9) : s)
+    if (typeof l.payload !== 'string') return { ok: false, message: `Không xác nhận được tạo BM "${name}"` }
+    const u = new URL(l.payload, 'https://business.facebook.com/').searchParams.get('business_id')
+    return u && /^\d+$/.test(u) ? { ok: true, message: `Đã tạo BM "${name}" (${u})` } : { ok: false, message: `Không xác nhận được tạo BM "${name}"` }
+  })
+}
+async function bmTao({ name, mode }) { // N()
+  if (mode === 'over') return taoBmCong(name)
+  if (mode === 'bm1') { const a = await thuLoi(() => taoBmGql(name, TAO_BM1)); return a.ok ? a : thuLoi(() => taoBmGql(name, { ...TAO_BM1, ten: 'useBusinessCreationMutationMutation' })) }
+  return taoBmGql(name, CAU_HINH_TAO_BM[mode] || CAU_HINH_TAO_BM[350])
+}
+async function bmRoi({ bmId }) { // M(bmId, "fb"): Graph v17.0 rồi GraphQL RemoveBusinessUserMutation (lỗi ⇒ câu của Graph)
+  const { user_id } = await getAdsToken()
+  const a = await jbGoi(`/${user_id}/businesses`, { version: 'v17.0', method: 'POST', body: { method: 'delete', business: bmId } })
+  if (!a.error) return { ok: true, message: `Đã thoát BM ${bmId}` }
+  const r = await gqlBm({ fb_api_req_friendly_name: 'RemoveBusinessUserMutation', doc_id: '23932916982960697', variables: JSON.stringify({ business_id: bmId, business_user_id: user_id }) })
+  return r.error ? { ok: false, message: a.message } : { ok: true, message: `Đã thoát BM ${bmId}` }
+}
+async function bmXoa({ bmId }) { // O() + P(): mã chặn trả về trang (trang dịch lý do)
+  const p = await gqlBm({ fb_api_req_friendly_name: 'BusinessCometErrorDisclosureModalQuery', doc_id: '27215392728139129', variables: JSON.stringify({ app_id_for_ig_oidc: null, business_id: bmId,
+    entry_point: 'BIZWEB_SETTINGS_LINKING_MANAGEMENT', flow_source: 'BIZ_WEB', flow_type: 'DELETE_BUSINESS_PORTFOLIO', ig_asset_id: null, ig_oidc_token: null, linking_direction: 'BUSINESS_DELETION',
+    page_id_for_qe_check: '0', page_ids: null, skip_page_check: true }) })
+  if (!p.error) {
+    const n = p.data?.business_linking_ineligibility
+    const codes = Array.isArray(n?.error_codes) ? n.error_codes.map(String) : []
+    if (codes.length) return { ok: false, blocked: codes }
+  }
+  const r = await gqlBm({ fb_api_req_friendly_name: 'BizKitSettingsScheduleBusinessPortfolioForDeletionMutation', doc_id: '25722797610721024', variables: JSON.stringify({ businessID: bmId }) })
+  if (r.error) return { ok: false, message: r.message }
+  return JSON.stringify(r).includes('business_is_scheduled_for_deletion') ? { ok: true, message: `Đã lên lịch xóa BM ${bmId}` } : { ok: false, message: `Không xác nhận được lịch xóa BM ${bmId}` }
+}
+async function bmNguoiDung() { // 60673 u(): bmId → business_user_id của tài khoản đang dùng; lỗi ⇒ dừng, giữ phần đã đọc
+  const m = {}
+  let t = '/me/business_users'
+  try {
+    for (let n = 0; n < 50 && t; n += 1) {
+      const r = await jbGoi(t, t.startsWith('https') ? {} : { version: 'v25.0', params: { fields: 'id,business{id}', limit: '200' } })
+      if (r.error) break
+      for (const e of r.data ?? []) { const b = e.business?.id; if (b && e.id) m[b] = String(e.id) }
+      t = r.paging?.next ?? null
+    }
+  } catch { /* như SMIT: bỏ qua */ }
+  return { ok: true, map: m }
+}
+async function ganQuyenTk(adId, buid) { // 96758 Z5(admin)
+  const r = await jbGoi(`/act_${adId}/assigned_users`, { method: 'POST', body: { user: buid, tasks: JSON.stringify(['MANAGE', 'ADVERTISE', 'ANALYZE']) } })
+  return r.error ? { ok: false, message: r.message } : r.success === true ? { ok: true, message: 'OK' } : { ok: false, message: 'Graph không trả success=true; kết quả chỉ định quyền không xác định' }
+}
+async function bmTaoTkqc({ bmId, name, currency, timezoneId, assign }) { // B() + $(): assign undefined = không gán, null = không thấy tài khoản
+  const a = await jbGoi(`/${bmId}/adaccount`, { version: 'v23.0', method: 'POST', body: { name, currency, timezone_id: timezoneId, partner: 'NONE', end_advertiser: bmId, media_agency: 'UNFOUND' } })
+  if (a.error) return { ok: false, message: a.message }
+  const id = a.account_id || a.id
+  if (!id) return { ok: false, message: `Không xác nhận được tạo TKQC trong BM ${bmId}` }
+  if (assign === undefined) return { ok: true, message: `Đã tạo TKQC ${id} trong BM ${bmId}` }
+  if (assign === null) return { ok: true, message: `Đã tạo TKQC ${id} trong BM ${bmId} — bỏ qua gán quyền: không tìm thấy tài khoản đang dùng trong BM` }
+  await ngu(1000 + Math.floor(2001 * Math.random()))
+  let g = await ganQuyenTk(id, assign)
+  if (!g.ok) { await ngu(3000); g = await ganQuyenTk(id, assign) }
+  return g.ok ? { ok: true, message: `Đã tạo TKQC ${id} trong BM ${bmId} và gán quyền Admin` } : { ok: true, message: `Đã tạo TKQC ${id} trong BM ${bmId} — gán quyền lỗi: ${g.message}` }
+}
+async function bmTaoPage({ bmId, name, bio = '' }) { // es()
+  const { user_id } = await getAdsToken()
+  const r = await gqlBm({ fb_api_req_friendly_name: 'BizKitSettingsCreateAdditionalProfilePlusMutation', doc_id: '24040062452298715',
+    variables: JSON.stringify({ input: { actor_id: user_id, client_mutation_id: '1', business_id: bmId, name, bio: String(bio).trim(), categories: ['2214'], creation_source: 'meta_business_suite' } }) })
+  if (r.error) return { ok: false, message: `${name}: ${r.message}` }
+  const i = r.data?.additional_profile_plus_create
+  const e = i?.error_message || i?.name_error || (i?.error_code ? `Facebook error ${i.error_code}` : null)
+  if (e) return { ok: false, message: `${name}: ${e}` }
+  return i?.additional_profile?.id ? { ok: true, message: `Đã tạo Page ${name} trong BM ${bmId}` } : { ok: false, message: `${name}: không xác nhận được Page đã tạo` }
+}
+async function bmThemMien({ bmId, domain }) { // e_(): relayFields + av/__aaid/__bid/__user
+  let uid = ''
+  try { uid = (await getAdsToken()).user_id || '' } catch { uid = '' }
+  if (!uid) return { ok: false, message: `${domain}: không lấy được Facebook User ID` }
+  const r = await gqlBm({ fb_api_req_friendly_name: 'BizKitSettingsAddNewDomainMutation', fb_api_caller_class: 'RelayModern', server_timestamps: 'true', doc_id: '31518389857776250',
+    variables: JSON.stringify({ business_id: bmId, owned_domain_name: domain }) }, relayBm({ av: uid, __aaid: '0', __bid: bmId, __user: uid }))
+  if (r.error) return { ok: false, message: `${domain}: ${r.message}` }
+  return r.data && Object.prototype.hasOwnProperty.call(r.data, 'business_settings_add_owned_domain') ? { ok: true, message: `Đã thêm miền ${domain} vào BM ${bmId}` } : { ok: false, message: `${domain}: không xác nhận được miền đã thêm` }
+}
+const nhoGiaoDienCu = new Map() // ev(): theo tài khoản — đang chờ hoặc xong < 60 s thì dùng lại; lỗi thì bỏ nhớ
+async function bmGiaoDienCu() {
+  const { user_id } = await getAdsToken()
+  const t = nhoGiaoDienCu.get(user_id)
+  if (t && (t.luc === undefined || Date.now() - t.luc < 60000)) return t.p
+  const n = { p: gqlBm({ doc_id: '8398852550167223', variables: JSON.stringify({ input: { client_mutation_id: '1', actor_id: user_id, bmc_optin_status: 'OPT_OUT' } }) })
+    .then((r) => (r.error ? { ok: false, message: r.message } : { ok: true, message: 'Đã chuyển về giao diện cũ (opt-out BM Console)' })) }
+  nhoGiaoDienCu.set(user_id, n)
+  const a = await n.p
+  if (a.ok) n.luc = Date.now(); else if (nhoGiaoDienCu.get(user_id) === n) nhoGiaoDienCu.delete(user_id)
+  return a
+}
+async function bmDoiTen({ bmId, name }) { // eg(): Graph v18.0 POST /{bm} name
+  const r = await jbGoi(`/${bmId}`, { version: 'v18.0', method: 'POST', body: { name } })
+  return r.error ? { ok: false, message: r.message } : { ok: true, message: `Đã đổi tên BM ${bmId} → ${name}` }
+}
+async function bmPhapLy({ bmId, info }) { // ep(): ô trống gửi "" như SMIT; thành công khi phản hồi có ID BM
+  const { user_id } = await getAdsToken()
+  const f = info || {}
+  const r = await gqlBm({ fb_api_req_friendly_name: 'BizKitSettingsUpdateBusinessDetailsMutation', doc_id: '10022067921177501', fb_api_caller_class: 'RelayModern', server_timestamps: 'true',
+    variables: JSON.stringify({ input: { client_mutation_id: '1', actor_id: user_id, business_id: bmId, business_profile: { legal_name: f.legalName,
+      address: { street1: f.street, street2: f.street2, city: f.city, state: f.state, postal_code: f.postal, country: f.country }, phone_number: f.phone, website_url: f.website, tax_id_number: f.taxId } } }) },
+  { av: user_id, __user: user_id })
+  if (r.error) return { ok: false, message: r.message }
+  return JSON.stringify(r).includes(bmId) ? { ok: true, message: `Đã cập nhật pháp lý BM ${bmId}` } : { ok: false, message: `BM ${bmId}: không xác nhận được cập nhật (test-live marker)` }
+}
+// WhatsApp (12436-12983, 21509): đọc thẳng bằng fetch như SMIT ey() rồi tự phân tích (eS/eE/eT/eC).
+const maPhien = () => `${Date.now()}-${Math.floor(1e10 * Math.random())}` // eI("")
+const docJson = (t) => { try { return JSON.parse(t.startsWith('for (;;);') ? t.slice(9) : t) } catch { return null } } // eS
+const boThe = (e) => { const t = typeof e === 'string' ? e : e?.__html; return t?.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim() || undefined } // eA
+const loiWaba = (e) => { // eE
+  const t = 'error' in e ? e.error : undefined
+  if (t) return t.message || t.error_user_msg || t.error_user_title || 'Graph error'
+  const n = e.errors?.[0]
+  return n ? n.description ?? boThe(n.description_raw) ?? boThe(n.description_html) ?? n.summary ?? n.message ?? null : null
+}
+const maLoiWaba = (e) => ('error' in e ? e.error : undefined)?.code ?? e.errors?.[0]?.code // eT
+const hetPhienWaba = (e) => [190, 102, 463, 467].includes(maLoiWaba(e)) // eC
+async function bmWabaTos({ bmId }) { // eM + eN: GET graph.facebook.com/graphql bằng mã đọc
+  return thuLoi(async () => {
+    const goi = async () => {
+      const t = await getAdsToken()
+      const q = new URLSearchParams({ method: 'post', locale: 'en_US', pretty: 'false', format: 'json', fb_api_req_friendly_name: 'useAcceptOptimizedDeliveryApiTosMutationMutation', doc_id: '9763356653753255',
+        fb_api_caller_class: 'RelayModern', server_timestamps: 'true', variables: JSON.stringify({ input: { client_mutation_id: '7', actor_id: t.user_id, business_id: bmId, app_id: '2892949377516980', log_session_id: maPhien(), acceptance_source: 'CLOUD_API_AND_MM_LITE_ES' } }),
+        access_token: t.access_token })
+      return docJson(await (await fetch(`https://graph.facebook.com/graphql?${q}`, { method: 'GET', credentials: 'include' })).text())
+    }
+    let t = await goi()
+    if (t && hetPhienWaba(t)) { await getAdsToken(true); t = await goi() }
+    if (!t) return { ok: false, message: `BM ${bmId}: phản hồi Accept ToS không hợp lệ` }
+    const n = loiWaba(t)
+    if (n) return { ok: false, message: `BM ${bmId}: Accept ToS thất bại: ${n}` }
+    if (!t.data?.xfb_accept_optimized_delivery_cloud_api_tos?.client_mutation_id) return { ok: false, message: `BM ${bmId}: không xác nhận được Accept ToS` }
+    return { ok: true, message: `BM ${bmId}: đã chấp nhận ToS` }
+  })
+}
+async function bmWabaTao({ bmId, name }) { // ex + eO + eP: adsmanager.facebook.com/api/graphql/
+  return thuLoi(async () => {
+    const goi = async () => {
+      const t = await getAdsToken()
+      const body = new URLSearchParams({ locale: 'en_US', __a: '1', fb_api_req_friendly_name: 'useCreateWhatsAppBusinessAPIAccountMutation_CreateWhatsAppBusinessAPIAccountMutation',
+        variables: JSON.stringify({ input: { actor_id: t.user_id, client_mutation_id: '5', app_id: '871411417255253', log_session_id: `WBxP--${maPhien()}`, business_id: bmId, api_account_type: 'EMBEDDED_SIGNUP',
+          creation_source: 'ADS_MANAGER', friendly_name: name, timezone_id: 66, primary_funding_source: null, on_behalf_of_business_id: null, partner_business_id: null, page_id: null, product: 'ADS_MANAGER',
+          disable_automatic_sharing: true, obo_onboarding_info_input: null, wa_biz_role: 'PAID_MSG_ACCOUNT_AND_BIZ_PRESENCE' } }),
+        server_timestamps: 'true', doc_id: '29701466519469036', fb_api_caller_class: 'RelayModern', fb_dtsg: t.fb_dtsg, lsd: t.lsd, av: t.user_id, __user: t.user_id }).toString()
+      return docJson(await (await fetch('https://adsmanager.facebook.com/api/graphql/', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-asbd-id': '1' }, body })).text())
+    }
+    let e = await goi()
+    if (e && hetPhienWaba(e)) { await getAdsToken(true); e = await goi() }
+    e = e ?? { errors: [{ message: 'Phản hồi GraphQL không hợp lệ' }] }
+    const a = loiWaba(e)
+    if (a) { const c = maLoiWaba(e); return { ok: false, message: `Tạo WABA ${name}: ${a}`, ...(c ? { code: c } : {}) } }
+    const r = e.data?.xfb_create_whatsapp_business_api_account?.whatsapp_business_account
+    const i = r?.id?.trim()
+    if (!i) return { ok: false, message: `Tạo WABA ${name} thất bại (không có WABA id trả về)` }
+    const b = r?.billing_payment_account?.id?.trim()
+    return { ok: true, message: `Đã tạo WABA ${name} trong BM ${bmId} (WABA ID: ${i})`, wabaId: i, ...(b ? { billingPaymentAccountId: b } : {}) }
+  })
+}
+async function bmBillingDs({ bmId }) { // e1(): BillingHubAccountsViewQuery (50 dòng, không đọc tiếp)
+  const t = await gqlBm({ fb_api_caller_class: 'RelayModern', fb_api_req_friendly_name: 'BillingHubAccountsViewQuery', server_timestamps: 'true', doc_id: '33952353404408520',
+    variables: JSON.stringify({ assetFilters: { whatsapp_business_account_statuses: ['ACTIVE', 'ONBOARDING'] }, assetTypes: ['WHATSAPP_BUSINESS_ACCOUNT'], businessID: bmId, count: 50, orderBy: null,
+      shouldImproveBusinessSettingsUri: true, shouldSkipFieldsInAccountsSurface: true, usePSPStartLogger: false }) })
+  if (t.error) return { ok: false, message: t.message }
+  const ed = t.data?.business?.connected_objects?.edges
+  if (!ed) return { ok: false, warn: true, message: `BM ${bmId}: không đọc được danh sách billing` }
+  const accounts = []
+  for (const e of ed) {
+    const w = e.node?.id?.trim(), p = e.node?.billingPaymentAccount?.payment_legacy_account_id?.trim()
+    if (w && p) accounts.push({ wabaId: w, paymentLegacyAccountId: p, currency: (e.balanceColumn?.currency ?? e.balanceColumn?.account_balance?.currency)?.trim().toUpperCase() || undefined, name: e.mainColumn?.accountName?.trim() ?? '' })
+  }
+  return { ok: true, accounts }
+}
+const uuidBm = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}` // e0
+const THUE_BM = { business_address: { city: 'Adscheck', country_code: 'US', state: 'GA', street1: 'Adscheck', street2: 'Adscheck', zip: '99999' }, business_name: 'Adscheck', is_personal_use: false, second_tax_id: '', tax_id: '', tax_registration_status: '' } // eX
+async function bmBillingSua({ pla, currency }) { // một lượt BillingAccountInformationUtilsUpdateAccountMutation (e8)
+  const { user_id } = await getAdsToken()
+  const now = Date.now(), f = `upl_${now}_${uuidBm()}`
+  const a = await gqlBm({ fb_api_caller_class: 'RelayModern', fb_api_req_friendly_name: 'BillingAccountInformationUtilsUpdateAccountMutation', server_timestamps: 'true', doc_id: '25847826658142446',
+    variables: JSON.stringify({ input: { billable_account_payment_legacy_account_id: pla, currency, device_country: null, tax: THUE_BM, timezone: null,
+      upl_logging_data: { context: 'billingaccountinfo', entry_point: 'whatsapp_ads', external_flow_id: f, target_name: 'BillingAccountInformationUtilsUpdateAccountMutation', user_session_id: f,
+        wizard_config_name: 'BUSINESS_INFO_SUB', wizard_name: 'COLLECT_ACCOUNT_INFO', wizard_screen_name: 'account_information_state_display', wizard_session_id: `upl_wizard_${now}_${uuidBm()}` },
+      actor_id: user_id, client_mutation_id: '0' }, includeCreateNewFromOldFragment: false }) }, relayBm())
+  if (a.error) return { ok: false, message: `${pla}: ${a.message}` }
+  return a.data?.billable_account_update?.payment_account?.id ? { ok: true } : { ok: false, message: `${pla}: không xác nhận được cập nhật` }
+}
+async function bmWabaDs({ bmId }) { // 21509 f(): luôn đọc mới
+  const n = await jbGoi(`/${bmId}`, { version: 'v20.0', params: { fields: 'whatsapp_business_accounts.limit(200){id,name,verified_name,status}' } })
+  return n.error ? { ok: false, message: n.message } : { ok: true, rows: n.whatsapp_business_accounts?.data ?? [] }
+}
+async function bmWabaXoa({ wabaId }) { // 21509 b()
+  const r = String(wabaId).trim()
+  let uid
+  try { uid = (await getAdsToken()).user_id } catch (e) { return { ok: false, message: String(e?.message || e) } }
+  const i = await gqlBm({ fb_api_req_friendly_name: 'useDeleteWhatsAppBusinessAccountMutation', doc_id: '9902575596489138', variables: JSON.stringify({ input: { actor_id: uid, client_mutation_id: '1', waba_id: r } }) })
+  if (i.error) return { ok: false, message: `${r}: ${i.message}` }
+  return i.data?.xfb_delete_whatsapp_business_account?.success ? { ok: true, message: `Đã xóa WABA ${r}` } : { ok: false, message: `${r}: WABA không xóa được` }
+}
+async function bmPageDs({ bmId }) { // 3732 m(): Page sở hữu + được chia sẻ (500, không đọc tiếp) — ô "Chọn Page" của Kích hoạt Page
+  const p = { fields: 'id,name,additional_profile_id,is_deactivated', limit: '500' }
+  const [t, a] = await Promise.all([jbGoi(`/${bmId}/owned_pages`, { params: p }), jbGoi(`/${bmId}/client_pages`, { params: p })])
+  if (t.error) return { ok: false, message: t.message }
+  if (a.error) return { ok: false, message: a.message }
+  const rows = []
+  const them = (ds, ownership) => { for (const o of ds) { const id = o.id?.trim(); if (!id) continue; const n = o.additional_profile_id?.trim(); rows.push({ bmId, classicPageId: id, ...(n ? { npeProfileId: n } : {}), ownership, name: o.name || id, isDeactivated: o.is_deactivated }) } }
+  them(t.data ?? [], 'owned'); them(a.data ?? [], 'client')
+  return { ok: true, rows }
+}
+async function pageKichHoat({ profileId }) { // 86817 MG(): www.facebook.com ReactivateProfileMutation, gửi thẳng (không thử lại phiên)
+  let n
+  try {
+    const { fb_dtsg, lsd, user_id } = await getAdsToken()
+    if (!fb_dtsg || !user_id) return { ok: false, message: 'thiếu phiên Facebook (fb_dtsg/user_id)' }
+    const t = { __user: user_id, fb_dtsg, lsd: lsd ?? '', fb_api_req_friendly_name: 'ReactivateProfileMutation', doc_id: '30461474920118000', variables: JSON.stringify({ profile_id: profileId, delegate_page_id: null }) }
+    n = await (await fetch('https://www.facebook.com/api/graphql/', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-asbd-id': '1' },
+      body: Object.entries(t).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&') })).text()
+  } catch (e) { return { ok: false, message: `lỗi kích hoạt Page: ${e?.message || String(e)}` } }
+  let l
+  try { l = JSON.parse(n.startsWith('for (;;);') ? n.slice(9) : n) } catch { return { ok: false, message: 'phản hồi kích hoạt Page không hợp lệ' } }
+  if (!l || typeof l !== 'object') return { ok: false, message: 'phản hồi kích hoạt Page không hợp lệ' }
+  const u = l.errors?.[0] ?? l.error
+  if (u) return { ok: false, message: (typeof u === 'string' ? u : (u && typeof u === 'object' && (u.description_raw || u.description || u.message || u.errorDescription || u.errorSummary)) || '') || l.errorDescription || l.errorSummary || 'GraphQL error' }
+  return l.data?.reactivate_profile?.id !== profileId ? { ok: false, message: 'không xác nhận được Page đã kích hoạt (thiếu data)' } : { ok: true, message: 'đã kích hoạt lại' }
+}
+
 // VIA của trình duyệt này (500:343-363 v()): Graph /me id,name,picture.width(100){url} bằng mã đọc — tab VIA (≥ 3.12.33).
 async function viaMe() {
   const e = await jbGoi('/me', { params: { fields: 'id,name,picture.width(100){url}' } })
@@ -1598,7 +1850,11 @@ const CONG_CU = { 'check-hold': checkHold, 'check-location-verification': checkL
   'boost-currency': boostCurrency, 'boost-page-posts': boostPagePosts, 'boost-publish': boostPublish, 'via-me': viaMe,
   'bm-list': bmList, 'bm-roles': bmRoles, 'bm-chi-tiet': bmChiTiet, 'bm-admin-an': bmAdminAn, 'bm-trang-thai': bmTrangThai, 'bm-loai': bmLoai, 'bm-khang': bmKhang,
   'page-mine': pageMine, 'page-bm-ds': pageBmDs, 'page-bm-quet': pageBmQuet, 'page-lo': pageLo, 'page-roles': pageRoles, 'page-dem-bai': pageDemBai, 'page-live': pageLive, 'page-kiem-tien': pageKiemTien,
-  'pixel-bm-ds': pixelBmDs, 'pixel-roles': pixelRoles, 'pixel-graph': pixelGraph, 'pixel-signals': pixelSignals, 'pixel-nguoi': pixelNguoi }
+  'pixel-bm-ds': pixelBmDs, 'pixel-roles': pixelRoles, 'pixel-graph': pixelGraph, 'pixel-signals': pixelSignals, 'pixel-nguoi': pixelNguoi,
+  'bm-tao': bmBoc(bmTao), 'bm-roi': bmBoc(bmRoi), 'bm-xoa': bmBoc(bmXoa), 'bm-nguoi-dung': bmNguoiDung, 'bm-tao-tkqc': bmBoc(bmTaoTkqc), 'bm-tao-page': bmBoc(bmTaoPage),
+  'bm-them-mien': bmBoc(bmThemMien), 'bm-giao-dien-cu': bmBoc(bmGiaoDienCu), 'bm-doi-ten': bmBoc(bmDoiTen), 'bm-phap-ly': bmBoc(bmPhapLy), 'bm-waba-tos': bmBoc(bmWabaTos),
+  'bm-waba-tao': bmBoc(bmWabaTao), 'bm-billing-ds': bmBoc(bmBillingDs), 'bm-billing-sua': bmBoc(bmBillingSua), 'bm-waba-ds': bmBoc(bmWabaDs), 'bm-waba-xoa': bmBoc(bmWabaXoa),
+  'bm-page-ds': bmBoc(bmPageDs), 'page-kich-hoat': bmBoc(pageKichHoat) }
 async function runTool(fn, payload) {
   const f = CONG_CU[fn]
   if (!f) return { ok: false, message: `Tiện ích chưa có chức năng ${fn} — cập nhật VAESA Extension` }
