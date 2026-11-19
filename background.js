@@ -2449,6 +2449,25 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         if (!id) return { ok: false, error: 'Thiếu asset_id' }
         return { ok: true, asset_id: id, limit: await self.vaesaSmit.fetchHiddenLimit(id, req.payload?.currency) }
       }
+      // Kho màn Smit — như SMIT cất danh sách trong chrome.storage.local của tiện ích (máy NV, không lên máy chủ).
+      // Chỉ cho đọc/ghi khoá bắt đầu "smit_". Kèm ID Facebook đang đăng nhập (cookie c_user) để web
+      // chỉ dùng lại kho của đúng tài khoản FB.
+      case 'VAESA_SMIT_CACHE_GET': {
+        const key = String(req.payload?.key || '')
+        if (!key.startsWith('smit_')) return { ok: false, error: 'Khoá kho không hợp lệ' }
+        const [got, c] = await Promise.all([
+          chrome.storage.local.get(key),
+          chrome.cookies.get({ url: 'https://www.facebook.com', name: 'c_user' }).catch(() => null),
+        ])
+        return { ok: true, value: got?.[key] ?? null, fb_user_id: c?.value || null }
+      }
+      case 'VAESA_SMIT_CACHE_SET': {
+        const key = String(req.payload?.key || '')
+        if (!key.startsWith('smit_')) return { ok: false, error: 'Khoá kho không hợp lệ' }
+        if (req.payload?.value == null) await chrome.storage.local.remove(key)
+        else await chrome.storage.local.set({ [key]: req.payload.value })
+        return { ok: true }
+      }
       default:
         return { ok: false, error: 'Unknown action: ' + req?.action }
     }

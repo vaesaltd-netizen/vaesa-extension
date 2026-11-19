@@ -43,6 +43,8 @@ const ACTION_MAP = {
   CRAWL_MBS: 'VAESA_CRAWL_MBS',
   FB_ADACCOUNTS: 'VAESA_FB_ADACCOUNTS',
   FB_HIDDEN_LIMIT: 'VAESA_FB_HIDDEN_LIMIT',
+  SMIT_CACHE_GET: 'VAESA_SMIT_CACHE_GET',
+  SMIT_CACHE_SET: 'VAESA_SMIT_CACHE_SET',
 }
 
 // Background → page push (sync progress, MQTT events...). Forward sang webapp qua postMessage.
