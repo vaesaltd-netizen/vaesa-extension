@@ -98,21 +98,57 @@ function demChienDich(acc) {
   }
 }
 
-// Map 1 TKQC thô → hàng cho bảng (32 cột). Số tiền giữ NGUYÊN chuỗi Graph (đã theo đơn vị tiền tệ),
-// web tự định dạng. account_status: 1 = Live, còn lại = Die.
-function mapAccount(acc) {
+// Vai trò 1 người dùng trong TKQC — chép SMIT 1927.de94d1f1.js hàm p().
+function vaiTro(u) {
+  const t = new Set([...(u.user_tasks || []), ...(u.tasks || []), ...(u.permissions || []), ...(u.roles || [])]
+    .map((x) => String(x).toUpperCase()).concat(String(u.role ?? '').toUpperCase()).filter(Boolean))
+  if (t.has('MANAGE') || t.has('ADMIN') || t.has('1001') || t.has('281423141961500')) return 'admin'
+  if (t.has('ADVERTISE') || t.has('ADVERTISER') || t.has('1002')) return 'advertiser'
+  if (t.has('ANALYZE') || t.has('ANALYST') || t.has('1003')) return 'analyst'
+  return 'other'
+}
+
+// Danh sách thẻ/phương thức thanh toán — chép SMIT hàm card_data (thẻ trùng funding_source lên đầu).
+function theThanhToan(acc) {
+  const m = acc.all_payment_methods || {}
+  const ds = [
+    ...(m.payment_method_direct_debits?.data || []).map((e) => ({ display: e.display_string?.match(/\d+/)?.[0] || 'Unknown', type: 'directdebit', credential_id: 'Unknown' })),
+    ...(m.pm_credit_card?.data || []).map((e) => {
+      const t = e.display_string || ''
+      return { display: t.match(/\d+/)?.[0] || 'Unknown', type: t.toLowerCase().match(/[^\d\W]+/)?.[0], credential_id: e.credential_id || 'Unknown' }
+    }),
+    ...(m.payment_method_paypal?.data || []).map((e) => ({ display: e.email_address || 'Unknown', type: 'paypal', credential_id: 'Unknown' })),
+    ...(m.payment_method_tokens?.data || []).map((e) => ({ display: e.type === undefined ? 'Unknown' : String(e.type), type: 'methodtoken', credential_id: 'Unknown' })),
+  ].filter((e, i, arr) => arr.findIndex((x) => x.type === e.type && x.display === e.display && x.credential_id === e.credential_id) === i)
+  if (!ds.length) return undefined
+  const dau = acc.funding_source_details?.display_string?.match(/\d+/)?.[0]
+  const i = dau ? ds.findIndex((e) => e.display === dau) : -1
+  if (i <= 0) return ds
+  const [x] = ds.splice(i, 1)
+  return [x, ...ds]
+}
+
+// Map 1 TKQC thô → hàng cho bảng. Số tiền giữ NGUYÊN chuỗi Graph, web chia theo bảng offset tiền tệ.
+function mapAccount(acc, myUserId) {
+  const users = (acc.users?.data || []).filter((u) => u.id).map((u) => ({ id: u.id, name: u.name, role: vaiTro(u), raw_role: u.role }))
+  const dem = (r) => users.filter((u) => u.role === r).length
+  const prepay = typeof acc.is_prepay_account === 'boolean' ? acc.is_prepay_account : null
+  const tpb = acc.total_prepay_balance
+  const prepayBalance = tpb?.amount_in_hundredths != null && tpb.amount_in_hundredths !== '' ? Number(tpb.amount_in_hundredths) / 100
+    : (tpb?.amount != null ? Number(String(tpb.amount).replace(/,/g, '')) : null)
+  const owner = typeof acc.owner === 'string' ? acc.owner : acc.owner?.id || ''
   return {
     account_id: acc.account_id,
     id: acc.id || (acc.account_id ? `act_${acc.account_id}` : ''),
     name: acc.name || '',
     account_status: acc.account_status ?? 0,
-    disable_reason: acc.disable_reason ?? 0,
+    disable_reason: acc.disable_reason ?? null,
     currency: acc.currency || '',
     balance: acc.balance ?? null,
     spend_cap: acc.spend_cap ?? null,
     amount_spent: acc.amount_spent ?? null,
     adtrust_dsl: acc.adtrust_dsl ?? null,
-    threshold: acc.adspaymentcycle?.data?.[0]?.threshold_amount ?? acc.adspaymentcycle?.threshold_amount ?? null,
+    threshold: acc.adspaymentcycle?.data?.[0]?.threshold_amount ?? null,
     next_bill_date: acc.next_bill_date || null,
     created_time: acc.created_time || null,
     timezone_name: acc.timezone_name || '',
@@ -120,16 +156,18 @@ function mapAccount(acc) {
     business_country_code: acc.business_country_code || '',
     business_state: acc.business_state || '',
     business_zip: acc.business_zip || '',
-    owner: acc.owner || '',
+    owner,
     owner_business_id: acc.owner_business?.id || '',
     owner_business_name: acc.owner_business?.name || '',
     agencies: (acc.agencies?.data || []).map((a) => ({ id: a.id, name: a.name })),
-    admin_count: (acc.users?.data || []).filter((u) => (u.tasks || []).includes('MANAGE') || u.role === 1001).length,
-    users_count: (acc.users?.data || []).length,
+    // Vai trò của CHÍNH người đang đăng nhập trong TKQC (cột Quyền).
+    my_role: myUserId ? (acc.users?.data || []).find((u) => u.id === myUserId)?.role ?? null : null,
+    role_counts: { admin: dem('admin'), analyst: dem('analyst'), advertiser: dem('advertiser') },
+    users_count: users.length,
     campaigns: demChienDich(acc),
-    is_prepay_account: acc.is_prepay_account ?? null,
-    total_prepay_balance: acc.total_prepay_balance ?? null,
-    funding: acc.funding_source_details?.display_string || '',
+    is_prepay_account: prepay,
+    prepay_balance: prepayBalance,
+    card_data: theThanhToan(acc),
   }
 }
 
@@ -167,8 +205,7 @@ async function fetchAdAccounts({ payment = true } = {}) {
   }
   return {
     accounts: raw.map((a) => {
-      const row = mapAccount(a)
-      if (a.__bm && !row.owner_business_id) { row.owner_business_id = a.__bm.id; row.owner_business_name = a.__bm.name }
+      const row = mapAccount(a, token.user_id)
       return row
     }),
     token: { user_id: token.user_id, user_name: token.user_name },
@@ -178,35 +215,47 @@ async function fetchAdAccounts({ payment = true } = {}) {
 // PUBLIC: Limit ẩn (ngưỡng chi tiêu ẩn) cho 1 TKQC — lệnh GraphQL riêng, gọi lười.
 async function fetchHiddenLimit(assetId, currency) {
   const token = await getAdsToken()
-  const body = new URLSearchParams({
-    doc_id: '6401661393282937',
-    variables: JSON.stringify({ assetID: String(assetId) }),
-    fb_dtsg: token.fb_dtsg || '',
-    lsd: token.lsd || '',
-    av: token.user_id || '0',
-    __a: '1',
-  })
-  const res = await fetch('https://www.facebook.com/api/graphql/', {
-    method: 'POST', credentials: 'include',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'X-FB-LSD': token.lsd || '' },
-    body: body.toString(),
-  })
-  const text = (await res.text()).replace(/^for \(;;\);/, '')
-  let json
-  try { json = JSON.parse(text) } catch { throw new Error('Không đọc được Limit ẩn') }
-  if (json.errors?.[0]?.code === 1675004) throw new Error('rate_limited') // SMIT: HiddenLimitRateLimitError
-  const raw = json.data?.billable_account_by_asset_id?.formatted_dsl
-  if (!raw) return null
-  // Chuẩn hoá: bỏ ký tự không phải số; tiền không lẻ thì bỏ hết dấu phân cách.
-  let n = raw.replace(/[^\d,.-]/g, '')
-  if (!n) return null
-  const cur = (currency || '').toUpperCase()
-  if (ZERO_DECIMAL.has(cur)) n = n.replace(/[.,]/g, '')
+  // Gọi GraphQL — chép SMIT 1927.de94d1f1.js module 14845 hàm w(): locale en_US, __a=1, x-asbd-id,
+  // chỉ đọc DÒNG ĐẦU câu trả lời (FB trả nhiều dòng JSON); www báo 1675002 → thử lại qua business.
+  const goi = async (host) => {
+    const body = new URLSearchParams({
+      locale: 'en_US', __a: '1',
+      doc_id: '6401661393282937',
+      variables: JSON.stringify({ assetID: String(assetId) }),
+      fb_dtsg: token.fb_dtsg || '', lsd: token.lsd || '',
+    })
+    const res = await fetch(`https://${host}.facebook.com/api/graphql/`, {
+      method: 'POST', credentials: 'include',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-asbd-id': '1' },
+      body: body.toString(),
+    })
+    let t = await res.text()
+    if (t.startsWith('for (;;);')) t = t.slice(9)
+    const dong = t.includes('\n') ? (t.split('\n')[0] || '').trim() : t
+    try { return JSON.parse(dong) } catch { throw new Error('Không đọc được Limit ẩn') }
+  }
+  let json = await goi('www')
+  if (json.errors?.[0]?.code === 1675002 || json.error === 1675002) json = await goi('business')
+  if (json.errors?.[0]?.code === 1675004 || json.error === 1675004) throw new Error('rate_limited') // SMIT: HiddenLimitRateLimitError
+  // Đọc số từ formatted_dsl — chép SMIT 1927.de94d1f1.js (module 17506).
+  const u = json.data?.billable_account_by_asset_id
+  const raw = u?.formatted_dsl
+  const cur = (u?.currency || currency || '').toUpperCase()
+  if (!raw) return { limit: null, currency: cur }
+  const n = raw.replace(/[^\d,.-]/g, '')
+  if (!n) return { limit: null, currency: cur }
+  let v = n
+  if (cur && ZERO_DECIMAL.has(cur)) v = n.replace(/[.,]/g, '')
   else if (n.includes(',') && n.includes('.')) {
     const dec = n.lastIndexOf(',') > n.lastIndexOf('.') ? ',' : '.'
-    n = n.replaceAll(dec === ',' ? '.' : ',', '').replace(dec, '.')
+    v = n.replaceAll(dec === ',' ? '.' : ',', '').replace(dec, '.')
+  } else if (n.includes(',')) v = n.length - n.lastIndexOf(',') - 1 === 3 ? n.replaceAll(',', '') : n.replace(',', '.')
+  else {
+    const parts = n.split('.')
+    if (parts.length > 2 || (parts.length === 2 && parts[1]?.length === 3)) v = parts.join('')
   }
-  return { raw, value: n }
+  const so = Number.parseFloat(v)
+  return { limit: Number.isFinite(so) ? so : null, currency: cur }
 }
 
 self.vaesaSmit = { fetchAdAccounts, fetchHiddenLimit }
