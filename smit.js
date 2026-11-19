@@ -1116,6 +1116,13 @@ async function boostMePages() { // eT: Via + Page của Via (lọc ở trang)
   const pages = await docTrangGraph('/me/accounts', { fields: 'id,name,is_published,is_promotable,tasks,roles{id,tasks}', limit: 40, type: 'page' })
   return { ok: true, via: { id: e.id, name: e.name ?? e.id }, pages }
 }
+// VIA của trình duyệt này (500:343-363 v()): Graph /me id,name,picture.width(100){url} bằng mã đọc — tab VIA (≥ 3.12.33).
+async function viaMe() {
+  const e = await jbGoi('/me', { params: { fields: 'id,name,picture.width(100){url}' } })
+  if (e.error) return { ok: false, message: e.message }
+  if (!e.id) return { ok: false, message: 'Không lấy được thông tin VIA từ Facebook.' }
+  return { ok: true, profile: { id: String(e.id), name: e.name ?? '', avatar: e.picture?.data?.url ?? '' } }
+}
 async function boostCurrency({ id }) { // oE
   if (!/^act_\d+$/.test(String(id ?? ''))) return { ok: false, message: 'Thiếu ID tài khoản quảng cáo' }
   const t = await jbGoi(`/${id}`, { params: { fields: 'currency,account_currency_ratio_to_usd' } })
@@ -1190,7 +1197,7 @@ async function openTab({ url }) {
 const CONG_CU = { 'check-hold': checkHold, 'check-location-verification': checkLocation, 'download-invoices': openInvoices,
   'activate-prepay': activatePrepay, 'delete-card': deleteCard, 'set-default-card': setDefaultCard, 'pay-debt': payDebt, 'open-tab': openTab,
   'import-campaign-xlsx': importXlsx, 'boost-gql': boostGql, 'boost-session': boostSession, 'boost-me-pages': boostMePages,
-  'boost-currency': boostCurrency, 'boost-page-posts': boostPagePosts, 'boost-publish': boostPublish }
+  'boost-currency': boostCurrency, 'boost-page-posts': boostPagePosts, 'boost-publish': boostPublish, 'via-me': viaMe }
 async function runTool(fn, payload) {
   const f = CONG_CU[fn]
   if (!f) return { ok: false, message: `Tiện ích chưa có chức năng ${fn} — cập nhật VAESA Extension` }
