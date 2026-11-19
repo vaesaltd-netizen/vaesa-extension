@@ -1049,6 +1049,132 @@ async function importXlsx(q) {
   return { ok: true, currency: cur }
 }
 
+// ── Lên Camp Boost Post (1128 runner e0 + 3732 oM đăng bài) — runner chạy ở TRANG như SMIT; tiện ích chỉ là đường gửi ─────────────
+// GraphQL theo UG friendlyNameInRequest + relayFields (1927:1846-1925): URL ?fb_api_req_friendly_name, đầu x-fb-friendly-name,
+// thân locale · __a · tên · RelayModern · doc_id · variables · fb_dtsg · lsd · __comet_req · jazoest · (av, __user cho G1-G4).
+// Chỉ nhận đúng 8 truy vấn đã chép (bảng dưới) — trang không gửi được doc_id khác.
+const BOOST_GQL = {
+  objectiveSpec: ['useLWICometObjectiveSpecListQuery', '28283176124712575', true],
+  budgetSlider: ['LWICometBudgetSliderEditorQuery', '28765281086465766', true],
+  locationMeta: ['lwiCometFetchLocationMetaQuery', '9716123845173867', true],
+  create: ['LWICometCreateBoostedComponentMutation', '9955578997835249', true],
+  locationSearch: ['useLWICometLocationDataSourceQuery', '9978491788870764', false],
+  targetingSearch: ['useLWICometDetailedTargetingSearchSuggestionsDataSourceQuery', '9723665934418669', false],
+  targetingRoot: ['LWICometBrowseDetailedTargetingTabsRootQuery', '9985674161496482', false],
+  targetingTab: ['LWICometBrowseDetailedTargetingBaseTabQuery', '9680794761958016', false],
+}
+const jazoest = (s) => { let t = 0; for (let n = 0; n < s.length; n++) t += s.charCodeAt(n); return `2${t}` } // p
+async function gqlTen(ten, docId, variables, coActor) {
+  const chay = async (token) => {
+    if (!token.fb_dtsg || !token.lsd) return { error: true, message: 'Token policy không trả session GraphQL' }
+    const goi = async (h) => {
+      const f = { locale: 'en_US', __a: '1', fb_api_req_friendly_name: ten, fb_api_caller_class: 'RelayModern', doc_id: docId, variables: JSON.stringify(variables),
+        fb_dtsg: token.fb_dtsg, lsd: token.lsd, __comet_req: '1', jazoest: jazoest(token.fb_dtsg), ...(coActor && token.user_id ? { av: token.user_id, __user: token.user_id } : {}) }
+      const res = await fetch(`https://${h}.facebook.com/api/graphql/?${new URLSearchParams({ fb_api_req_friendly_name: ten })}`, { method: 'POST', credentials: 'include',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-asbd-id': '1', 'x-fb-friendly-name': ten }, body: new URLSearchParams(f).toString() })
+      return docGraphql(await res.text())
+    }
+    let r = await goi('www')
+    if (r.error && r.code === 1675002) r = await goi('business') // www đăng xuất ⇒ gọi qua business như SMIT
+    return r
+  }
+  const r = await chay(await getAdsToken())
+  return loiPhien(r) ? chay(await getAdsToken(true)) : r
+}
+async function boostGql({ key, variables }) {
+  const q = BOOST_GQL[key]
+  if (!q) return { ok: false, message: `Truy vấn không hợp lệ: ${key}` }
+  const r = await gqlTen(q[0], q[1], variables || {}, q[2])
+  return r.error ? { ok: false, message: r.message || 'GraphQL error' } : { ok: true, data: r.data }
+}
+async function boostSession() { // em(): phiên Facebook hiện tại (user id dùng cho av/__user + actor_id)
+  const t = await getAdsToken()
+  return t.user_id ? { ok: true, userId: t.user_id } : { ok: false, message: 'Không lấy được phiên Facebook để tạo Boost Post' }
+}
+// 22646 u: đọc hết trang Graph; trang sau phải ở graph.facebook.com (bỏ access_token để JB gắn lại); lặp vòng ⇒ dừng.
+const trangGraphHopLe = (s) => { const u = new URL(s); if (u.protocol !== 'https:' || u.hostname !== 'graph.facebook.com') throw new Error('seed-camp-invalid-pagination-origin'); return u }
+async function docTrangGraph(path, params) {
+  const out = [], da = new Set()
+  let a = path, dau = true
+  while (a) {
+    if (da.has(a)) throw new Error('seed-camp-pagination-cycle')
+    da.add(a)
+    const r = await jbGoi(a, dau ? { params } : {})
+    if (r.error) throw new Error(r.message)
+    out.push(...(r.data ?? []))
+    a = r.paging?.next ? (() => { const u = trangGraphHopLe(r.paging.next); u.searchParams.delete('access_token'); return u.toString() })() : undefined
+    dau = false
+  }
+  return out
+}
+async function boostMePages() { // eT: Via + Page của Via (lọc ở trang)
+  const e = await jbGoi('/me', { params: { fields: 'id,name' } })
+  if (e.error) return { ok: false, message: e.message }
+  if (!e.id) return { ok: false, message: 'Facebook did not return the current Via ID' }
+  const pages = await docTrangGraph('/me/accounts', { fields: 'id,name,is_published,is_promotable,tasks,roles{id,tasks}', limit: 40, type: 'page' })
+  return { ok: true, via: { id: e.id, name: e.name ?? e.id }, pages }
+}
+async function boostCurrency({ id }) { // oE
+  if (!/^act_\d+$/.test(String(id ?? ''))) return { ok: false, message: 'Thiếu ID tài khoản quảng cáo' }
+  const t = await jbGoi(`/${id}`, { params: { fields: 'currency,account_currency_ratio_to_usd' } })
+  if (t.error) return { ok: false, message: t.message }
+  if (!t.currency) return { ok: false, message: 'Facebook did not return the ad account currency' }
+  return { ok: true, currency: t.currency, ratio: t.account_currency_ratio_to_usd }
+}
+const TRUONG_BAI = 'call_to_action,message,is_eligible_for_promotion,promotable_id,attachments.limit(10){description,description_tags,media,media_type,target,title,type,subattachments,unshimmed_url,url},likes.summary(total_count),shares,comments.summary(total_count).limit(0)'
+async function boostPagePosts({ pageId }) { // o5: mã Page → đọc hết bài (100/trang) bằng mã Page
+  if (!/^\d+$/.test(String(pageId ?? ''))) return { ok: false, message: 'Page ID không hợp lệ' }
+  const n = await jbGoi(`/${pageId}`, { params: { fields: 'access_token' } })
+  if (n.error) return { ok: false, message: n.message }
+  if (!n.access_token) return { ok: false, message: 'Facebook did not return the Page access token' }
+  const out = [], da = new Set()
+  let c = `https://graph.facebook.com/v24.0/${pageId}/posts?${new URLSearchParams({ fields: TRUONG_BAI, limit: '100', access_token: n.access_token, suppress_http_code: '1' })}`
+  while (c) {
+    if (da.has(c)) throw new Error('seed-camp-pagination-cycle')
+    da.add(c)
+    const e = JSON.parse(await (await fetch(c, { credentials: 'include' })).text())
+    if (e.error) return { ok: false, message: e.error.message ?? 'Facebook could not load Page Posts' }
+    out.push(...(e.data ?? []))
+    c = e.paging?.next ? (() => { const u = trangGraphHopLe(e.paging.next); u.searchParams.set('access_token', n.access_token); return u.toString() })() : undefined
+  }
+  return { ok: true, posts: out }
+}
+// oM (3732:10795-10895): mã Page (access_token rồi additional_profile_id,access_token) → có ảnh: POST /photos (ảnh + caption);
+// chỉ chữ: POST /feed message. Mất mạng / 502-504 ⇒ "không xác định" (bài có thể đã lên). Tên phần ảnh "source" theo Graph API
+// (SMIT dựng multipart trong tiện ích SMIT Connect, mã không có trong bản đọc).
+async function boostPublish({ pageId, text = '', image }) {
+  if (!/^\d+$/.test(String(pageId ?? ''))) return { ok: false, message: 'Page ID không hợp lệ' }
+  let tok = null, loi = null
+  for (const f of ['access_token', 'additional_profile_id,access_token']) {
+    const l = await jbGoi(`/${pageId}`, { params: { fields: f } })
+    if (!l.error && l.access_token) { tok = l.access_token; break }
+    if (l.error) loi ??= l.message
+  }
+  if (!tok) return loi ? { ok: false, message: loi } : { ok: false, tokenMissing: true }
+  const dc = (p, t) => `https://graph.facebook.com/v24.0${p}?${new URLSearchParams({ ...t, suppress_http_code: '1', format: 'json' })}` // o_
+  let raw
+  try {
+    if (image) {
+      const bin = Uint8Array.from(atob(String(image.fileBase64 || '')), (x) => x.charCodeAt(0))
+      const fd = new FormData()
+      fd.append('source', new Blob([bin], { type: image.fileType }), image.fileType === 'image/png' ? 'image.png' : 'image.jpg')
+      const res = await fetch(dc(`/${pageId}/photos`, { access_token: tok, caption: text, published: 'true' }), { method: 'POST', credentials: 'include', body: fd })
+      if ([502, 503, 504].includes(res.status)) return { ok: false, unverified: true, detail: `HTTP ${res.status}` }
+      raw = await res.text()
+    } else {
+      const res = await fetch(dc(`/${pageId}/feed`, { access_token: tok }), { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ message: text, published: 'true' }).toString() })
+      raw = await res.text()
+    }
+  } catch (e) { return { ok: false, unverified: true, detail: String(e?.message || e) } }
+  let l = null
+  try { l = JSON.parse(String(raw).replace(/^for \(;;\);/, '')) } catch { l = null } // oE
+  const t = l && l.error
+  if (t) return { ok: false, message: t.message || t.error_user_msg || t.error_user_title || 'Facebook error' }
+  const r = image ? l?.post_id : l?.id
+  return r ? { ok: true, postId: r } : { ok: false, noId: true }
+}
+
 // Mở trang thanh toán Facebook ở tab nền (lite:651-662 chrome.tabs.create active:false) — chỉ nhận đường dẫn facebook.com.
 async function openTab({ url }) {
   let u
@@ -1061,7 +1187,8 @@ async function openTab({ url }) {
 // Một cửa cho các công cụ mới (trang gọi FB_TOOL { fn, payload }) — đỡ phải thêm lệnh riêng cho từng công cụ.
 const CONG_CU = { 'check-hold': checkHold, 'check-location-verification': checkLocation, 'download-invoices': openInvoices,
   'activate-prepay': activatePrepay, 'delete-card': deleteCard, 'set-default-card': setDefaultCard, 'pay-debt': payDebt, 'open-tab': openTab,
-  'import-campaign-xlsx': importXlsx }
+  'import-campaign-xlsx': importXlsx, 'boost-gql': boostGql, 'boost-session': boostSession, 'boost-me-pages': boostMePages,
+  'boost-currency': boostCurrency, 'boost-page-posts': boostPagePosts, 'boost-publish': boostPublish }
 async function runTool(fn, payload) {
   const f = CONG_CU[fn]
   if (!f) return { ok: false, message: `Tiện ích chưa có chức năng ${fn} — cập nhật VAESA Extension` }
