@@ -163,6 +163,8 @@ function mapAccount(acc, myUserId) {
     // Vai trò của CHÍNH người đang đăng nhập trong TKQC (cột Quyền).
     my_role: myUserId ? (acc.users?.data || []).find((u) => u.id === myUserId)?.role ?? null : null,
     role_counts: { admin: dem('admin'), analyst: dem('analyst'), advertiser: dem('advertiser') },
+    // Danh sách người trong TKQC (SMIT 1927 h(): tên + vai trò) — web dựng gợi ý ô SL Admin (≥ 3.12.32).
+    admin_users: users.map((u) => ({ id: u.id, name: u.name, role: u.role })),
     users_count: users.length,
     campaigns: demChienDich(acc),
     is_prepay_account: prepay,
