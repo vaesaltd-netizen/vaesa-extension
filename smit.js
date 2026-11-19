@@ -936,6 +936,119 @@ async function payDebt({ id, values = {} }) {
   return { ok: false, message: `Thanh toán dư nợ thất bại với ${bonSo ? `thẻ ${bonSo}` : `${cards.length} thẻ`}: ${loi.join(' | ')}` }
 }
 
+// ── Tạo chiến dịch bằng file XLSX (eI, 1128:4307-4714) — vòng tạo + nghỉ chạy ở TRANG như SMIT (runner ở trang, tiện ích là
+// đường gửi); ở đây chỉ hai việc ngắn để không vướng giới hạn 5 phút của service worker:
+//   phase "check":  er (hỏi tiền tệ/trạng thái nếu trang không có) → trạng thái {1,8,9} → kiểm tài sản ed/em/ev/ek.
+//   phase "create": một lệnh POST /act_{id}/{campaigns|adsets|adcreatives|ads} (eg). Graph v18.0.
+async function jbGoi(path, { version = 'v24.0', method = 'GET', params = {}, body } = {}) { // JB 1927:1760-1844
+  const chay = async (token) => {
+    let url
+    if (path.startsWith('https')) {
+      const u = new URL(path)
+      for (const k of ['access_token', 'format', 'pretty', 'suppress_http_code', 'locale']) u.searchParams.delete(k)
+      for (const [k, v] of Object.entries({ access_token: token.access_token, format: 'json', pretty: '0', suppress_http_code: '1', locale: 'en_US' })) u.searchParams.set(k, v)
+      url = u.toString()
+    } else url = `https://graph.facebook.com/${version}${path}?${new URLSearchParams({ ...params, access_token: token.access_token, format: 'json', pretty: '0', suppress_http_code: '1', locale: 'en_US' })}`
+    const init = { method, credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded' } }
+    if (method !== 'GET' && body) init.body = Object.entries(body).filter(([, v]) => v !== undefined).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`).join('&')
+    const res = await fetch(url, init)
+    let j
+    try { j = await res.json() } catch { return { error: true, message: 'Phản hồi Graph không hợp lệ' } }
+    if (j?.error) return { error: true, message: j.error.message || j.error.error_user_msg || j.error.error_user_title || 'Graph error', code: j.error.code }
+    return j
+  }
+  const r = await chay(await getAdsToken())
+  return loiPhien(r) ? chay(await getAdsToken(true)) : r
+}
+class LoiKiemTaiSan extends Error {} // ei
+async function docHet(path, params) { // es: đọc hết các trang (paging.next)
+  const out = []
+  let a = path
+  while (a) {
+    const r = await jbGoi(a, { version: 'v18.0', ...(a.startsWith('https') ? {} : { params }) })
+    if (r.error) throw new LoiKiemTaiSan(r.message)
+    out.push(...(r.data ?? []))
+    a = r.paging?.next
+  }
+  return out
+}
+const TRUONG_PAGE = 'id,is_published,is_promotable' // el
+const TRUONG_BM = `owned_pages.limit(100){${TRUONG_PAGE}},client_pages.limit(100){${TRUONG_PAGE}}` // eu
+async function taiSanTK(acc, hashes) { // ed
+  const fields = ['adspixels.limit(100){id}', ...(hashes.length ? [`adimages.hashes(${JSON.stringify(hashes)}){hash}`] : []), `owner_business{id,${TRUONG_BM}}`, `agencies.limit(50){id,${TRUONG_BM}}`].join(',')
+  const a = await jbGoi(`/act_${acc}`, { version: 'v18.0', params: { fields } })
+  if (a.error) throw new LoiKiemTaiSan(a.message)
+  const pixels = new Set(a.adspixels?.paging?.next ? (await docHet(`/act_${acc}/adspixels`, { fields: 'id', limit: 100 })).map((x) => x.id ?? '') : (a.adspixels?.data ?? []).map((x) => x.id ?? ''))
+  pixels.delete('')
+  const images = new Set((a.adimages?.data ?? []).map((x) => x.hash ?? '').filter(Boolean))
+  const pages = []
+  for (const b of [a.owner_business, ...(a.agencies?.data ?? [])].filter((x) => !!x?.id)) {
+    for (const k of ['owned_pages', 'client_pages']) pages.push(...(b[k]?.paging?.next ? await docHet(`/${b.id}/${k}`, { fields: TRUONG_PAGE, limit: 100 }) : b[k]?.data ?? []))
+  }
+  return { pixels, images, businessPages: pages }
+}
+async function kiemPage(bmPages, canDs) { // ev + em
+  const can = new Set(canDs)
+  if (!can.size) return []
+  const biet = new Set(), chuaXB = new Set()
+  const ghi = (p) => { if (!p.id) return; biet.add(p.id); if (can.has(p.id) && (p.is_published === false || p.is_promotable === false)) chuaXB.add(p.id) }
+  for (const p of bmPages) ghi(p)
+  let thieu = [...can].filter((x) => !biet.has(x))
+  let chac = true
+  if (thieu.length) {
+    try { for (const p of await docHet('/me/accounts', { fields: 'id,tasks,is_published,is_promotable', limit: 100 })) if (p.tasks?.some((t) => t === 'ADVERTISE' || t.endsWith('_ADVERTISE'))) ghi(p) } catch { chac = false }
+    if (chac) thieu = thieu.filter((x) => !biet.has(x))
+  }
+  const ra = [...chuaXB].map((p) => `Page ${p} chưa sẵn sàng chạy quảng cáo (chưa xuất bản, hoặc đang bị hạn chế quảng cáo) — Facebook sẽ nhận quảng cáo rồi từ chối phân phối. Vào cài đặt page bật xuất bản và gỡ hạn chế, hoặc sửa cột "Link Object ID" và "Story ID" sang page khác.`)
+  if (!thieu.length) return ra
+  if (!chac) throw new LoiKiemTaiSan('page-routes-incomplete')
+  return [...ra, ...thieu.map((p) => `Page ${p} không dùng được: Via đang chạy không có quyền quảng cáo (ADVERTISE) trên page, và BM của TKQC cũng không sở hữu page này — cấp quyền ADVERTISE cho Via, gắn page vào BM của TKQC, hoặc sửa cột "Link Object ID" và "Story ID" sang page dùng được.`)]
+}
+async function kiemAnhVideo(images, anhDs, videoDs) { // ek — anhDs = [[mã đã bỏ tiền tố, mã gốc], …]
+  const ra = []
+  for (const [h, goc] of anhDs) if (!images.has(h)) ra.push(`Ảnh ${goc} không thuộc TKQC này — mã ảnh chỉ dùng được ở TKQC đã tải nó lên. Tải lại ảnh vào TKQC này rồi thay cột "Image Hash", hoặc xoá cột "Image Hash" để dùng ảnh mặc định của bài viết.`)
+  for (const v of videoDs) {
+    const r = await jbGoi(`/${v}`, { version: 'v18.0', params: { fields: 'id' } })
+    if (r.error) throw new LoiKiemTaiSan(`video ${v}: ${r.message}`)
+    if (!r.id) ra.push(`Video ${v} không dùng được với Via đang chạy — cấp quyền cho Via trên page/TKQC chứa video, hoặc sửa cột "Video ID" sang video khác.`)
+  }
+  return ra
+}
+const LOAI_TAO = new Set(['campaigns', 'adsets', 'adcreatives', 'ads'])
+async function importXlsx(q) {
+  const acc = boAct(q.id)
+  if (!acc) return { ok: false, message: 'Thiếu ID tài khoản quảng cáo' }
+  if (q.phase === 'create') { // eg
+    if (!LOAI_TAO.has(q.kind)) return { ok: false, message: `Lệnh tạo không hợp lệ: ${q.kind}` }
+    const path = `/act_${acc}/${q.kind}`
+    const n = await jbGoi(path, { version: 'v18.0', method: 'POST', body: q.body || {} })
+    if (n.error) return { ok: false, message: n.message }
+    if (!n.id) return { ok: false, message: `Graph không trả id cho ${path}: ${JSON.stringify(n)}` }
+    return { ok: true, id: n.id }
+  }
+  if (q.phase !== 'check') return { ok: false, message: `Bước không hợp lệ: ${q.phase}` }
+  let cur = q.currency, st = q.status
+  if (!cur) { // er
+    const r = await jbGoi(`/act_${acc}`, { version: 'v18.0', params: { fields: 'currency,account_status' } })
+    if (r.error) throw new Error(r.message)
+    cur = r.currency || 'USD'; st = r.account_status ?? 0
+  }
+  if (![1, 8, 9].includes(st)) return { ok: false, message: `TKQC đang ở trạng thái ${st} nên Facebook không cho chạy quảng cáo (chỉ chạy được khi trạng thái là 1, 8 hoặc 9). Chưa tạo gì cả — kháng nghị TKQC hoặc chọn TKQC khác rồi chạy lại.` }
+  const hong = [], khongKiem = []
+  const anh = Array.isArray(q.images) ? q.images : []
+  let m = { pixels: new Set(), images: new Set(), businessPages: [] }
+  try { m = await taiSanTK(acc, anh.map(([h]) => h)) } catch (e) { if (!(e instanceof LoiKiemTaiSan)) throw e; khongKiem.push(e.message) }
+  if (!khongKiem.length) {
+    hong.push(...(q.pixels || []).filter((p) => !m.pixels.has(p)).map((p) => `Pixel ${p} chưa được chia sẻ cho TKQC này — chia sẻ pixel cho TKQC trong BM, hoặc xoá cột "Optimized Conversion Tracking Pixels" và "Optimized Event" rồi đổi "Optimization Goal" OFFSITE_CONVERSIONS sang mục tiêu khác (vd LINK_CLICKS).`))
+    for (const kiem of [() => kiemPage(m.businessPages, q.pages || []), () => kiemAnhVideo(m.images, anh, q.videos || [])]) {
+      try { hong.push(...(await kiem())) } catch (e) { if (!(e instanceof LoiKiemTaiSan)) throw e; khongKiem.push(e.message) }
+    }
+  }
+  if (!hong.length && khongKiem.length) return { ok: false, message: `Chưa kiểm được quyền dùng page/video nên không tạo gì cả (${khongKiem.join('; ')}). Thường do token thiếu quyền đọc trang hoặc video. Chạy lại bằng Via có quyền với các tài sản đó, hoặc sửa file XLSX cho khớp.` }
+  if (hong.length) return { ok: false, message: `TKQC này không dùng được một số tài sản trong file nên chưa tạo gì cả. Sửa file XLSX rồi chạy lại:\n${hong.join('\n')}` }
+  return { ok: true, currency: cur }
+}
+
 // Mở trang thanh toán Facebook ở tab nền (lite:651-662 chrome.tabs.create active:false) — chỉ nhận đường dẫn facebook.com.
 async function openTab({ url }) {
   let u
@@ -947,7 +1060,8 @@ async function openTab({ url }) {
 
 // Một cửa cho các công cụ mới (trang gọi FB_TOOL { fn, payload }) — đỡ phải thêm lệnh riêng cho từng công cụ.
 const CONG_CU = { 'check-hold': checkHold, 'check-location-verification': checkLocation, 'download-invoices': openInvoices,
-  'activate-prepay': activatePrepay, 'delete-card': deleteCard, 'set-default-card': setDefaultCard, 'pay-debt': payDebt, 'open-tab': openTab }
+  'activate-prepay': activatePrepay, 'delete-card': deleteCard, 'set-default-card': setDefaultCard, 'pay-debt': payDebt, 'open-tab': openTab,
+  'import-campaign-xlsx': importXlsx }
 async function runTool(fn, payload) {
   const f = CONG_CU[fn]
   if (!f) return { ok: false, message: `Tiện ích chưa có chức năng ${fn} — cập nhật VAESA Extension` }
