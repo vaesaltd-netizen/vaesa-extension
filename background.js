@@ -1,7 +1,8 @@
 // VAESA Extension v3.0.0 — service worker.
 
-// Màn Smit (danh sách TKQC Facebook) — self.vaesaSmit.
-importScripts('smit.js')
+// Màn Smit (danh sách TKQC Facebook) — self.vaesaSmit. Bọc try: smit.js lỗi thì chỉ màn Smit hỏng, phần gửi tin
+// của nhân viên vẫn chạy (anh Trung 19/11: bản Smit đang làm dở vẫn tự cập nhật xuống máy NV).
+try { importScripts('smit.js') } catch (e) { console.error('[VAESA] nạp smit.js lỗi:', e?.message || e) }
 //
 // Port verbatim từ Retion 0.2.3.1 (EXT-0.2.3.1).
 // Source: chrome-extension/src/background/background/facebook/{user,client,page}.ts
