@@ -405,5 +405,14 @@ async function spendLimit({ id, mode, amount }) {
     : { ok: false, message: 'GraphQL không xác nhận được reset số đã chi' }
 }
 
-self.vaesaSmit = { fetchAdAccounts, fetchHiddenLimit, fetchSpend, openCloseAccount, spendLimit }
+// Đổi tên TKQC — SMIT 1128 module 95953 hàm c(): POST /act_X {name}; tên đã tính sẵn ở web (hậu tố ngẫu nhiên/tuần tự).
+async function renameAccount({ id, name }) {
+  const acc = boAct(id)
+  if (!acc) return { ok: false, message: 'Thiếu ID tài khoản' }
+  const r = await graphPost(`act_${acc}`, { name: String(name || '') })
+  if (r.loi) return { ok: false, message: r.loi }
+  return { ok: true, message: `Đã đổi tên → ${name}`, patch: { name } }
+}
+
+self.vaesaSmit = { fetchAdAccounts, fetchHiddenLimit, fetchSpend, openCloseAccount, spendLimit, renameAccount }
 })()
