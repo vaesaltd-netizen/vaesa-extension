@@ -736,8 +736,209 @@ async function openInvoices({ id, url, fileName }) {
   }
 }
 
+// Graph REST như SMIT JB (1927:1760-1842): tham số rồi access_token, format=json, pretty=0, suppress_http_code=1, locale=en_US.
+async function graphJB(path, params = {}) {
+  const chay = async (token) => {
+    const q = new URLSearchParams({ ...params, access_token: token.access_token, format: 'json', pretty: '0', suppress_http_code: '1', locale: 'en_US' })
+    const res = await fetch(`${GRAPH}/${path}?${q.toString()}`, { credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded' } })
+    let j
+    try { j = await res.json() } catch { return { error: true, message: 'Phản hồi Graph không hợp lệ' } }
+    if (j?.error) return { error: true, message: j.error.message || j.error.error_user_msg || j.error.error_user_title || 'Graph error', code: j.error.code }
+    return j
+  }
+  const r = await chay(await getAdsToken())
+  return loiPhien(r) ? chay(await getAdsToken(true)) : r
+}
+// Thẻ của TKQC (delete-card g 1128:3246-3263 / set-default-card l 7917-7934): xoá thẻ lấy dãy số ĐẦU, đặt mặc định lấy nhóm 4 số CUỐI.
+async function layThe(acc, kieuSo, them = '') {
+  const r = await graphJB(`act_${acc}`, { fields: `all_payment_methods{pm_credit_card{credential_id,display_string}}${them}` })
+  if (r.error) throw new Error(r.message)
+  return (r.all_payment_methods?.pm_credit_card?.data || []).map((e) => {
+    const t = e.display_string ?? ''
+    const display = kieuSo === 'cuoi' ? (t.match(/\d{4}(?!.*\d)/)?.[0] || t.match(/\d+/)?.[0] || 'Unknown') : (t.match(/\d+/)?.[0] || 'Unknown')
+    return { display, type: t.toLowerCase().match(/[^\d\W]+/)?.[0], credential_id: e.credential_id || 'Unknown' }
+  })
+}
+
+// Kích hoạt trả trước (u, 1128:3601-3632): BillingPrepayActivateMutation @business; không lỗi GraphQL là xong.
+async function activatePrepay({ id }) {
+  const acc = boAct(id)
+  if (!acc) return { ok: false, message: 'Thiếu ID tài khoản' }
+  const token = await getAdsToken()
+  const r = await goiGraphql('business', { fb_api_req_friendly_name: 'BillingPrepayActivateMutation', doc_id: '4886770528075857',
+    variables: JSON.stringify({ input: { billable_account_payment_legacy_account_id: acc, recurring_enabled: false, actor_id: token.user_id, client_mutation_id: '3' } }) })
+  if (r.error) return { ok: false, message: r.message }
+  return { ok: true, message: 'Đã kích hoạt trả trước (GraphQL)' }
+}
+
+// Xoá thẻ (w, 1128:3289-3423): chọn thẻ theo chế độ, xoá LẦN LƯỢT từng thẻ (nghỉ 1–3 giây giữa 2 thẻ), mỗi thẻ một đích.
+async function deleteCard({ id, values = {}, cardData = [] }) {
+  const mode = String(values.mode ?? 'all')
+  if (!['all', 'card_list', 'credential'].includes(mode)) return { ok: false, message: 'Chế độ xóa thẻ không hợp lệ' }
+  if (values.confirm !== true) return { ok: false, message: 'Cần bật xác nhận trước khi xóa thẻ thanh toán' }
+  const acc = boAct(id)
+  if (!acc) return { ok: false, message: 'Thiếu ID tài khoản' }
+  const duoi = [...new Set(String(values.cardNumbers ?? '').match(/\d{4}/g) ?? [])]
+  if (mode === 'card_list' && !duoi.length) return { ok: false, message: 'Vui lòng nhập ít nhất một mã 4 số cuối thẻ cần xóa' }
+  const ma = [...String(values.credentialIds ?? '').split(/\r?\n/), String(values.credentialId ?? '')].map((x) => x.trim()).filter(Boolean)
+  if (mode === 'credential' && !ma.length) return { ok: false, message: 'Thiếu mã định danh thẻ cần xóa' }
+  const ds = await layThe(acc, 'dau', ',funding_source_details{display_string,type}')
+  const the = ds.length ? ds : cardData
+  const xoaDuoc = the.filter((c) => c.credential_id && c.credential_id !== 'Unknown')
+  const chon = mode === 'credential' ? xoaDuoc.filter((c) => ma.includes(c.credential_id)) : mode === 'card_list' ? xoaDuoc.filter((c) => duoi.includes(c.display)) : xoaDuoc
+  const theoMa = mode === 'all' || (mode === 'credential' && String(values.credentialIds ?? '').trim() !== '')
+  const thieu = mode === 'credential' && theoMa
+    ? ma.filter((x) => !chon.some((c) => c.credential_id === x)).map((x) => ({ id: x, ok: false, message: 'Không tìm thấy thẻ cần xóa — có thể thẻ đã bị gỡ' })) : []
+  if (!chon.length) {
+    if (mode === 'credential') return { ok: false, message: 'Không tìm thấy thẻ cần xóa — có thể thẻ đã bị gỡ', ...(thieu.length ? { targets: thieu } : {}) }
+    if (mode === 'card_list') return { ok: false, message: `Không tìm thấy thẻ khớp 4 số cuối: ${duoi.join(', ')}` }
+    return { ok: false, message: 'Không tìm thấy thẻ có credential_id' }
+  }
+  const dich = (c) => (theoMa ? { id: c.credential_id, displayId: c.display } : { id: c.display })
+  const token = await getAdsToken()
+  const kq = []
+  for (let i = 0; i < chon.length; i++) {
+    if (i > 0) await ngu(1000 + Math.floor(2001 * Math.random()))
+    const c = chon[i]
+    const r = await goiGraphql('www', { doc_id: '9195168280589012', variables: JSON.stringify({ input: { payment_account_id: acc, payment_method_id: c.credential_id, actor_id: token.user_id } }) })
+    kq.push({ c, ok: !r.error, reason: r.error ? r.message : undefined })
+  }
+  const okC = kq.filter((x) => x.ok), loiC = kq.filter((x) => !x.ok)
+  const nhan = okC.map((x) => x.c.display).join(', ')
+  const nhanLoi = loiC.map((x) => `${x.c.display}: ${x.reason ?? 'không rõ lỗi'}`).join('; ')
+  const tom = okC.length && !loiC.length ? { ok: true, message: `Đã xóa ${okC.length} thẻ${nhan ? ` (${nhan})` : ''}` }
+    : okC.length ? { ok: false, message: `PARTIAL — đã xóa ${okC.length} thẻ${nhan ? ` (${nhan})` : ''}; lỗi ${loiC.length} thẻ: ${nhanLoi}` }
+      : { ok: false, message: `Không xóa được thẻ nào: ${nhanLoi || 'không rõ lỗi'}` }
+  const daXoa = new Set(okC.map((x) => x.c.credential_id))
+  const patch = daXoa.size ? { card_data: the.filter((c) => !daXoa.has(c.credential_id)) } : undefined
+  return { ok: tom.ok, message: tom.message, targets: [...kq.map((x) => ({ ...dich(x.c), ok: x.ok, message: x.ok ? 'Đã xóa' : x.reason ?? 'không rõ lỗi' })), ...thieu], ...(patch ? { patch } : {}) }
+}
+
+// Đặt thẻ mặc định (c, 1128:7939-8001): thẻ đầu tiên có 4 số cuối khớp → đặt làm thẻ chính; không thẻ nào khớp = bỏ qua (không phải lỗi).
+async function setDefaultCard({ id, values = {}, cardData = [] }) {
+  const cred = String(values.credentialId ?? '')
+  const duoi = cred ? '' : (String(values.cardSuffix ?? '').match(/\d{4}/)?.[0] ?? '')
+  if (!cred && !duoi) return { ok: false, message: 'Vui lòng nhập 4 số cuối thẻ cần đặt mặc định' }
+  const acc = boAct(id)
+  if (!acc) return { ok: false, message: 'Thiếu ID tài khoản quảng cáo' }
+  const ds = await layThe(acc, 'cuoi')
+  const the = ds.length ? ds : cardData
+  const c = the.find((x) => x.credential_id && x.credential_id !== 'Unknown' && (cred ? x.credential_id === cred : String(x.display).endsWith(duoi)))
+  if (!c) return cred ? { ok: false, message: 'Không tìm thấy thẻ này trên tài khoản — có thể thẻ đã bị xoá' } : { ok: true, skipped: true, message: `Không tìm thấy thẻ khớp 4 số cuối ${duoi}` }
+  const token = await getAdsToken()
+  const r = await goiGraphql('www', { doc_id: '24268156329457050',
+    variables: JSON.stringify({ input: { billable_account_payment_legacy_account_id: acc, primary_funding_id: c.credential_id, actor_id: token.user_id, client_mutation_id: String(Math.floor(30 * Math.random()) + 1) } }) })
+  if (r.error) return { ok: false, message: r.message }
+  const i = cardData.findIndex((x) => x.credential_id === c.credential_id)
+  return { ok: true, message: `Đã set thẻ mặc định ${c.display}`, ...(i > 0 ? { patch: { card_data: [cardData[i], ...cardData.filter((_, j) => j !== i)] } } : {}) }
+}
+
+// Thanh toán dư nợ (v + b, 1128:7097-7439). Trang chỉ gọi khi dòng đang "Cần thanh toán" (status 3).
+// Màn Billing Hub "Thanh toán ngay" → xem lại thẻ → gửi lệnh trả (tối đa 3 lần; Facebook đòi 3DS thì mở trang 3DS rồi gửi lại).
+// Thử lần lượt từng thẻ (thẻ chính trước), dừng ở thẻ đầu tiên trả được.
+const bon = (x) => { const d = String(x ?? '').replace(/\D/g, ''); return d.length >= 4 ? d.slice(-4) : d } // f
+const maNgau = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`
+const b64 = (s) => { let n = ''; for (const c of new TextEncoder().encode(s)) n += String.fromCharCode(c); return btoa(n) }
+async function manNo(acc) { // BillingPayNowLandingScreenQuery
+  const r = await goiGraphql('business', { fb_api_req_friendly_name: 'BillingPayNowLandingScreenQuery', doc_id: '27042179815412290', variables: JSON.stringify({ intent: 'PAY_NOW', paymentAccountID: acc }) })
+  if (r.error) return { ok: false, message: r.message }
+  const B = r.data?.payment_account?.billable_account
+  if (!B) return { ok: false, message: 'Landing không trả billable_account' }
+  const bal = B.account_balance_with_offset ?? B.account_balance
+  const amount = String(bal?.amount ?? '').trim()
+  const so = Number(amount)
+  if (!amount || !(Number.isFinite(so) && so > 0)) return { ok: true, skipped: true, message: 'Không có dư nợ cần trả' }
+  const key = String(B.selected_payment_card_key ?? B.selected_payment_method_key ?? '')
+  const m = new Map()
+  for (const x of [...(Array.isArray(B.payment_methods) ? B.payment_methods : B.payment_methods?.data || []), ...(B.all_payment_methods?.pm_credit_card?.data || [])]) {
+    const raw = x?.credential_id ?? x?.id
+    if (raw == null || raw === '') continue
+    const id = String(raw)
+    m.set(id, { credentialId: id, credentialType: String(x.credential_type ?? x.type ?? 'CREDIT_CARD').toUpperCase(), display: String(x.display_string ?? x.display ?? id), isPrimary: key !== '' && id === key })
+  }
+  if (key && !m.has(key)) m.set(key, { credentialId: key, credentialType: 'CREDIT_CARD', display: key, isPrimary: true })
+  const cards = [...m.values()].sort((a, b) => Number(b.isPrimary) - Number(a.isPrimary))
+  if (!cards.length) return { ok: false, message: 'Không có thẻ thanh toán hiển thị' }
+  return { amount, amountWithOffset: String(bal?.amount_with_offset ?? amount).trim() || amount, currency: String(bal?.currency ?? '').trim().toUpperCase() || 'USD', cards }
+}
+function tim3ds(t) { // tìm sâu: chuỗi external_uri / external_url / url trỏ trang /payments/3ds_ của facebook.com
+  if (!t || typeof t !== 'object') return null
+  const n = t.external_uri ?? t.external_url ?? t.url
+  if (typeof n === 'string') {
+    try { const u = new URL(n, 'https://business.facebook.com'); if (/(^|\.)facebook\.com$/i.test(u.hostname) && u.pathname.includes('/payments/3ds_')) return n } catch { /* không phải đường dẫn */ }
+  }
+  for (const v of Object.values(t)) {
+    if (Array.isArray(v)) { for (const x of v) { const u = tim3ds(x); if (u) return u } } else if (v && typeof v === 'object') { const u = tim3ds(v); if (u) return u }
+  }
+  return null
+}
+async function traBangThe(acc, actor, ln, the, truocKhiTra) {
+  const ten = bon(the.display) || the.display
+  const xem = await goiGraphql('business', { fb_api_req_friendly_name: 'BillingReviewPaymentScreenQuery', doc_id: '25448543034774360',
+    variables: JSON.stringify({ creditCardID: the.credentialId, paymentAccountID: acc, sharedStoredBalanceID: '' }) })
+  if (xem.error) return { ok: false, message: `Review thẻ ${ten} thất bại: ${xem.message ?? 'không rõ lỗi'}` }
+  await truocKhiTra()
+  for (let lan = 0; lan <= 2; lan += 1) {
+    const U = `upl_${Math.floor(Date.now() / 1000)}_${maNgau()}`, W = `rd_${Date.now()}_${maNgau()}`
+    const T = b64(JSON.stringify({ payload: b64(JSON.stringify({ data: { amount: String(ln.amountWithOffset), cred_id: String(the.credentialId), currency: ln.currency }, nonce: maNgau(), op: 'CHARGE', ver: 1 })), signatures: [] }))
+    const r = await goiGraphql('business', { fb_api_req_friendly_name: 'BillingPayNowOrSettleStatePayNowMutation', doc_id: '24676694655347193',
+      variables: JSON.stringify({ input: {
+        billable_account_payment_legacy_account_id: acc, credential_id: the.credentialId, payment_amount: { amount: ln.amount, currency: ln.currency },
+        transaction_initiation_source: 'CUSTOMER',
+        upl_logging_data: { billing_notification_id: '', context: 'billingpaynow', credential_id: the.credentialId, credential_type: the.credentialType || 'CREDIT_CARD', entry_point: 'BILLING_HUB',
+          external_flow_id: U, target_name: 'BillingPayNowOrSettleStatePayNowMutation', user_session_id: U, wizard_config_name: 'PAY_NOW_BILLING_HUB', wizard_name: 'PAY_NOW',
+          wizard_screen_name: 'pay_now_review_state_display', wizard_session_id: W },
+        platform_trust_token: T, actor_id: actor, client_mutation_id: String(Date.now()),
+      } }) })
+    if (r.error) return { ok: false, message: r.message }
+    const url = tim3ds(r)
+    if (!url) {
+      const t = JSON.stringify(r).toLowerCase()
+      return t.includes('billable_account') || t.includes('payment_account')
+        ? { ok: true, message: `Đã thanh toán dư nợ ${ln.amount} ${ln.currency} bằng thẻ ${ten}` }
+        : { ok: false, message: 'GraphQL không xác nhận được thanh toán dư nợ' }
+    }
+    if (lan >= 2) break
+    try { await fetch(url, { method: 'GET', credentials: 'include', headers: { 'cache-control': 'no-store' } }) } catch (e) {
+      return { ok: false, message: `Không xử lý được xác minh 3DS: ${e?.message || 'không rõ lỗi'}` }
+    }
+  }
+  return { ok: false, message: 'Chưa hoàn tất xác minh 3DS' }
+}
+async function lamMoiSoDu(acc) { // đọc lại trạng thái / số dư / ngưỡng sau khi trả (1128:7097-7118), theo khuôn dòng của mapAccount
+  const r = await graphJB(`act_${acc}`, { fields: 'account_id,account_status,currency,balance,adspaymentcycle{threshold_amount},is_prepay_account,total_prepay_balance' })
+  if (r.error) return undefined
+  const tpb = r.total_prepay_balance
+  return {
+    account_status: r.account_status ?? 0, balance: r.balance ?? null, threshold: r.adspaymentcycle?.data?.[0]?.threshold_amount ?? null,
+    is_prepay_account: typeof r.is_prepay_account === 'boolean' ? r.is_prepay_account : null,
+    prepay_balance: tpb?.amount_in_hundredths != null && tpb.amount_in_hundredths !== '' ? Number(tpb.amount_in_hundredths) / 100 : (tpb?.amount != null ? Number(String(tpb.amount).replace(/,/g, '')) : null),
+  }
+}
+async function payDebt({ id, values = {} }) {
+  const acc = boAct(id)
+  if (!acc) return { ok: false, message: 'Thiếu ID tài khoản' }
+  const s = typeof values.cardLast4 === 'string' ? values.cardLast4.trim() : ''
+  let bonSo = ''
+  if (s) { const d = s.replace(/\D/g, ''); if (!/^\d{4}$/.test(d)) return { ok: false, message: '4 số cuối thẻ phải gồm đúng 4 chữ số' }; bonSo = d }
+  const ln = await manNo(acc)
+  if ('ok' in ln) return ln
+  const cards = bonSo ? ln.cards.filter((c) => bon(c.display) === bonSo || bon(c.credentialId) === bonSo) : ln.cards
+  if (!cards.length) return { ok: false, message: `Không tìm thấy thẻ có 4 số cuối ${bonSo}` }
+  const token = await getAdsToken()
+  const loi = []
+  let daNghi = false
+  for (const the of cards) {
+    const r = await traBangThe(acc, token.user_id, ln, the, async () => { if (daNghi) await ngu(1000 + Math.floor(2001 * Math.random())); daNghi = true })
+    if (r.ok) { const p = await lamMoiSoDu(acc).catch(() => undefined); return p ? { ...r, patch: p } : r }
+    loi.push(`${bon(the.display) || the.display}: ${r.message}`)
+  }
+  return { ok: false, message: `Thanh toán dư nợ thất bại với ${bonSo ? `thẻ ${bonSo}` : `${cards.length} thẻ`}: ${loi.join(' | ')}` }
+}
+
 // Một cửa cho các công cụ mới (trang gọi FB_TOOL { fn, payload }) — đỡ phải thêm lệnh riêng cho từng công cụ.
-const CONG_CU = { 'check-hold': checkHold, 'check-location-verification': checkLocation, 'download-invoices': openInvoices }
+const CONG_CU = { 'check-hold': checkHold, 'check-location-verification': checkLocation, 'download-invoices': openInvoices,
+  'activate-prepay': activatePrepay, 'delete-card': deleteCard, 'set-default-card': setDefaultCard, 'pay-debt': payDebt }
 async function runTool(fn, payload) {
   const f = CONG_CU[fn]
   if (!f) return { ok: false, message: `Tiện ích chưa có chức năng ${fn} — cập nhật VAESA Extension` }
