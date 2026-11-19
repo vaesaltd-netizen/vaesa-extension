@@ -1203,6 +1203,194 @@ async function bmKhang({ id }) { // 1128:9218-9264: GraphQL business doc 2419615
   return { ok: true, data: r.json?.data?.assetOwnerData ?? null }
 }
 
+// ── Tab Page (SMIT 6747 module 87405 + 86630 E_ + 94169 z) — ≥ 3.12.35. Trang điều phối như 1128 module 87789 (tải theo nguồn,
+// chi tiết theo lô 50, đếm admin/bài, Page live, kiếm tiền); tiện ích chỉ làm từng lệnh ĐỌC ngắn, trả dữ liệu thô cho trang đổi thành dòng.
+const PAGE_G = 'id,name,additional_profile_id,page_created_time,verification_status,currency,promotion_ineligible_reason,role,perms,tasks' // 87405 g
+const PAGE_MINE = 'id,name,additional_profile_id,page_created_time,verification_status,currency,promotion_eligible,promotion_ineligible_reason,role,perms,tasks,roles' // B()
+const PAGE_CANH = ['owned_pages', 'client_pages'] // h
+const PAGE_BO = new Set(['role', 'perms', 'tasks']) // P: trường bỏ khi Facebook báo lỗi 200 ở trang đầu
+const gonPage = (e) => ({ id: e.id, name: e.name, additional_profile_id: e.additional_profile_id, page_created_time: e.page_created_time, verification_status: e.verification_status,
+  currency: e.currency, promotion_eligible: e.promotion_eligible, promotion_ineligible_reason: e.promotion_ineligible_reason, role: e.role, perms: e.perms, tasks: e.tasks })
+async function pageMine() { // j("/me/accounts"): 100/trang theo paging.next; trang đầu lỗi 200 ⇒ bỏ role/perms/tasks, rồi còn "id"
+  const items = [], daQua = new Set()
+  let next = null, fields = PAGE_MINE, dau = true
+  do {
+    const dich = next ?? '/me/accounts'
+    if (daQua.has(dich)) return { ok: false, message: 'canonical-pagination-cycle' }
+    daQua.add(dich)
+    let r = await jbGoi(dich, dich.startsWith('https') ? {} : { params: { fields, limit: '100' } })
+    while (r.error && dau && r.code === 200) {
+      const bot = fields.split(',').filter((x) => !PAGE_BO.has(x)).join(',')
+      const moi = bot !== fields ? bot : fields === 'id' ? null : 'id'
+      if (moi === null) break
+      fields = moi
+      r = await jbGoi(dich, { params: { fields, limit: '100' } })
+    }
+    if (r.error) return { ok: false, message: r.message, code: r.code }
+    dau = false
+    for (const e of r.data ?? []) if (e.id) items.push(gonPage(e))
+    next = r.paging?.next
+  } while (next)
+  return { ok: true, items }
+}
+async function pageBmDs() { // $(): /me/businesses?fields=id,name&limit=100, đọc hết các trang
+  const items = [], daQua = new Set()
+  let next = null
+  do {
+    const dich = next ?? '/me/businesses'
+    if (daQua.has(dich)) return { ok: false, message: 'canonical-pagination-cycle' }
+    daQua.add(dich)
+    const r = await jbGoi(dich, dich.startsWith('https') ? {} : { params: { fields: 'id,name', limit: '100' } })
+    if (r.error) return { ok: false, message: r.message, code: r.code }
+    for (const e of r.data ?? []) if (e.id) items.push({ id: e.id, name: e.name })
+    next = r.paging?.next
+  } while (next)
+  return { ok: true, items }
+}
+function sauCuaPage(next) { // _(): con trỏ "after" của paging.next
+  if (!next) return undefined
+  const t = new URL(next).searchParams.get('after')?.trim()
+  if (!t) throw new Error('page-scan-missing-cursor')
+  return t
+}
+async function quetCanhPage(bmId, canh, node) { // v() + 19724 m(): đọc tiếp owned/client_pages 500/trang, tối đa 20 lượt, trùng ID giữ bản sau
+  const m = new Map(), daQua = new Set()
+  let sau
+  for (let i = 0; i < 20; i += 1) {
+    let kq
+    if (i === 0) kq = { rows: (node.data ?? []).filter((e) => !!e.id), next: sauCuaPage(node.paging?.next) }
+    else {
+      const r = await jbGoi(`/${bmId}/${canh}`, { params: { fields: PAGE_G, limit: '500', after: sau } })
+      if (r.error) throw new Error(r.message)
+      kq = { rows: (r.data ?? []).filter((e) => !!e.id), next: sauCuaPage(r.paging?.next) }
+    }
+    for (const e of kq.rows) { const id = String(e.id).trim(); if (id) m.set(id, e) }
+    if (!kq.next) return { data: [...m.values()] }
+    if (daQua.has(kq.next)) throw new Error('bm-pagination-repeated-cursor')
+    daQua.add(kq.next)
+    sau = kq.next
+  }
+  throw new Error('bm-pagination-page-cap')
+}
+async function pageBmQuet({ bms }) { // E() + A(): lô ≤ 50 BM — owned_pages / client_pages .limit(500){g} qua Graph batch v24.0
+  const ds = (bms || []).slice(0, 50).map((b) => ({ id: String(b.id), name: b.name }))
+  const f = PAGE_CANH.map((k) => `${k}.limit(500){${PAGE_G}}`).join(',')
+  const reqs = ds.map(({ id }) => ({ method: 'GET', relative_url: `${id}?fields=${encodeURIComponent(f)}` }))
+  const s = await jbGoi('', { method: 'POST', body: { include_headers: 'false', batch: JSON.stringify(reqs) } })
+  if (s?.error) return { ok: false, message: s.message, code: s.code }
+  if (!Array.isArray(s)) return { ok: false, message: 'Phản hồi batch quét Page không phải mảng.', code: 500 }
+  if (s.length !== reqs.length) return { ok: false, message: 'Batch quét Page trả về thiếu kết quả so với số BM đã hỏi.', code: 500 }
+  const items = []
+  for (let i = 0; i < ds.length; i += 1) {
+    const b = ds[i], it = s[i]
+    let k
+    if (!it) k = { ok: false, message: 'Facebook không trả kết quả quét Page cho BM này.' }
+    else {
+      let t, hong = false
+      try { t = JSON.parse(it.body ?? '') } catch { hong = true }
+      if (hong) k = { ok: false, message: 'Phản hồi quét Page không hợp lệ cho BM này.' }
+      else if (t.error) k = { ok: false, message: t.error.message ?? 'Facebook từ chối quét Page của BM này.', ...(t.error.code === undefined ? {} : { code: t.error.code }) }
+      else if (it.code !== undefined && it.code >= 400) k = { ok: false, message: `Facebook trả lỗi ${it.code} khi quét Page của BM này.`, code: it.code }
+      else k = { ok: true, node: t }
+    }
+    if (!k.ok) { items.push({ bmId: b.id, bmName: b.name ?? '', ok: false, message: k.message, ...(k.code === undefined ? {} : { code: k.code }) }); continue }
+    try {
+      for (const canh of PAGE_CANH) { const r = k.node[canh]; if (r?.paging?.next) k.node[canh] = await quetCanhPage(b.id, canh, r) }
+    } catch (e) { items.push({ bmId: b.id, bmName: b.name ?? '', ok: false, message: e instanceof Error ? e.message : String(e) }); continue }
+    items.push({ bmId: b.id, bmName: b.name, ok: true, owned: (k.node.owned_pages?.data ?? []).map(gonPage), client: (k.node.client_pages?.data ?? []).map(gonPage) })
+  }
+  return { ok: true, items }
+}
+async function pageLo({ lo }) { // eo(): mỗi phần tử là danh sách relative_url (≤ 50) ⇒ một Graph batch GET tới v24.0 (locale en_US); các lô chạy song song
+  const token = await getAdsToken()
+  const chay = async (urls) => {
+    const reqs = (urls || []).slice(0, 50).map((u) => ({ method: 'GET', relative_url: String(u) }))
+    if (!reqs.length) return { ok: true, items: [] }
+    const res = await fetch(GRAPH, { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ access_token: token.access_token, include_headers: 'false', batch: JSON.stringify(reqs), suppress_http_code: '1', locale: 'en_US' }).toString() })
+    let s = null
+    try { s = JSON.parse(await res.text()) } catch { s = null }
+    if (!Array.isArray(s)) return { ok: false, message: 'Batch lỗi hoặc phản hồi không hợp lệ' }
+    return { ok: true, items: s.map((x) => ({ code: x?.code ?? null, body: x?.body ?? null })) }
+  }
+  return { ok: true, kq: await Promise.all((lo || []).slice(0, 4).map(chay)) }
+}
+async function pageRoles({ id }) { // z(): /{page}/roles?fields=id,name,tasks,perms,role&limit=200 đọc hết; lỗi / vòng lặp ⇒ không có
+  const out = [], daQua = new Set()
+  let next = null
+  do {
+    const dich = next ?? `/${id}/roles`
+    if (daQua.has(dich)) return { ok: false }
+    daQua.add(dich)
+    const r = await jbGoi(dich, dich.startsWith('https') ? {} : { params: { fields: 'id,name,tasks,perms,role', limit: '200' } })
+    if (r.error) return { ok: false }
+    out.push(...(r.data ?? []))
+    next = r.paging?.next
+  } while (next)
+  return { ok: true, data: out }
+}
+async function demBaiPage(id, token) { // 86630 u(): /v25.0/{page}/posts?fields=id&limit=100, tối đa 200 lượt
+  let so = 0, sau = '', xong = false
+  for (let n = 0; n < 200; n += 1) {
+    const q = new URLSearchParams({ fields: 'id', limit: '100', access_token: token, suppress_http_code: '1' })
+    if (sau) q.set('after', sau)
+    let a
+    try { a = JSON.parse(await (await fetch(`https://graph.facebook.com/v25.0/${id}/posts?${q}`, { credentials: 'include' })).text()) } catch { break }
+    if (a.error) break
+    for (const e of a.data ?? []) if (e.id) so += 1
+    const c = a.paging?.cursors?.after
+    if (!a.paging?.next || !c || (a.data?.length ?? 0) === 0) { xong = true; break }
+    sau = c
+  }
+  return { so, xong }
+}
+async function pageDemBai({ id }) { // 86630 E_(): mã người dùng trước; chưa đếm hết ⇒ mã Page (94169 z: access_token, rồi additional_profile_id,access_token)
+  const tk = (await getAdsToken()).access_token
+  const a = tk ? await demBaiPage(id, tk) : null
+  if (a?.xong) return { ok: true, total: a.so }
+  let pt = null
+  for (const f of ['access_token', 'additional_profile_id,access_token']) {
+    const r = await jbGoi(`/${id}`, { params: { fields: f } })
+    if (!r.error && r.access_token) { pt = r.access_token; break }
+  }
+  if (!pt) return { ok: false, message: 'không lấy được Page access token (Via cần quyền quản trị Page)' }
+  const b = await demBaiPage(id, pt)
+  return b.xong ? { ok: true, total: b.so } : { ok: false, message: 'không đếm hết được bài viết (đọc feed bị gián đoạn)' }
+}
+async function pageLive({ id }) { // em(): LiveProducerLiveBoostingDialogQuery @business (av = Page) ⇒ is_live_producer_boosting_enabled
+  const tk = await getAdsToken()
+  const ten = 'LiveProducerLiveBoostingDialogQuery'
+  const body = new URLSearchParams({ av: String(id), __user: tk.user_id || '', __a: '1', __req: '1', dpr: '1', __ccg: 'EXCELLENT', fb_dtsg: tk.fb_dtsg || '', lsd: tk.lsd || '',
+    fb_api_caller_class: 'RelayModern', fb_api_req_friendly_name: ten, doc_id: '26628087783443795',
+    variables: JSON.stringify({ pageID: String(id), adAccountID: '', isNullAdAccount: true }), server_timestamps: 'true' })
+  const res = await fetch('https://business.facebook.com/api/graphql/', { method: 'POST', credentials: 'include',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-fb-friendly-name': ten, 'x-fb-lsd': tk.lsd || '' }, body: body.toString() })
+  const u = await res.text()
+  const t = u.match(/(?:"|\\")is_live_producer_boosting_enabled(?:"|\\")\s*:\s*(true|false)/i) ?? u.match(/is_live_producer_boosting_enabled["'\s:]+(true|false)/i)
+  return { ok: true, eligible: t?.[1] ? t[1].toLowerCase() === 'true' : null }
+}
+async function pageKiemTien() { // eh(): creator_monetization eligibility_widget (45 s) ⇒ trạng thái công cụ kiếm tiền theo Page
+  const tk = await getAdsToken()
+  let l = ''
+  try {
+    const ctrl = new AbortController()
+    const hen = setTimeout(() => ctrl.abort(), 45000)
+    try {
+      const res = await fetch('https://www.facebook.com/creator_monetization/eligibility_widget/?surface=facebook_partner_program_fb4c', { method: 'POST', credentials: 'include', signal: ctrl.signal,
+        headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-fb-lsd': tk.lsd || '', 'x-asbd-id': '359341' },
+        body: new URLSearchParams({ av: tk.user_id || '', __user: tk.user_id || '', __a: '1', __req: '2', dpr: '1', __ccg: 'EXCELLENT', fb_dtsg: tk.fb_dtsg || '', jazoest: jazoest(tk.fb_dtsg || ''), lsd: tk.lsd || '' }).toString() })
+      l = await res.text()
+    } finally { clearTimeout(hen) }
+  } catch (e) { return { ok: true, warning: e instanceof Error ? e.message : String(e) } }
+  const d = l.startsWith('for (;;);') ? l.slice(9) : l
+  if (!d.trim()) return { ok: true, warning: 'Creator monetization không trả dữ liệu.' }
+  let t
+  try { t = JSON.parse(d) } catch { return { ok: true, warning: 'Creator monetization trả phản hồi không phải JSON.' } }
+  const byId = {}
+  for (const e of t?.payload ?? []) { const id = e?.basicInfo?.id; if (id) byId[id] = e.monetizationToolsEligibilityStatus ?? {} }
+  return { ok: true, byId }
+}
+
 // VIA của trình duyệt này (500:343-363 v()): Graph /me id,name,picture.width(100){url} bằng mã đọc — tab VIA (≥ 3.12.33).
 async function viaMe() {
   const e = await jbGoi('/me', { params: { fields: 'id,name,picture.width(100){url}' } })
@@ -1285,7 +1473,8 @@ const CONG_CU = { 'check-hold': checkHold, 'check-location-verification': checkL
   'activate-prepay': activatePrepay, 'delete-card': deleteCard, 'set-default-card': setDefaultCard, 'pay-debt': payDebt, 'open-tab': openTab,
   'import-campaign-xlsx': importXlsx, 'boost-gql': boostGql, 'boost-session': boostSession, 'boost-me-pages': boostMePages,
   'boost-currency': boostCurrency, 'boost-page-posts': boostPagePosts, 'boost-publish': boostPublish, 'via-me': viaMe,
-  'bm-list': bmList, 'bm-roles': bmRoles, 'bm-chi-tiet': bmChiTiet, 'bm-admin-an': bmAdminAn, 'bm-trang-thai': bmTrangThai, 'bm-loai': bmLoai, 'bm-khang': bmKhang }
+  'bm-list': bmList, 'bm-roles': bmRoles, 'bm-chi-tiet': bmChiTiet, 'bm-admin-an': bmAdminAn, 'bm-trang-thai': bmTrangThai, 'bm-loai': bmLoai, 'bm-khang': bmKhang,
+  'page-mine': pageMine, 'page-bm-ds': pageBmDs, 'page-bm-quet': pageBmQuet, 'page-lo': pageLo, 'page-roles': pageRoles, 'page-dem-bai': pageDemBai, 'page-live': pageLive, 'page-kiem-tien': pageKiemTien }
 async function runTool(fn, payload) {
   const f = CONG_CU[fn]
   if (!f) return { ok: false, message: `Tiện ích chưa có chức năng ${fn} — cập nhật VAESA Extension` }
