@@ -604,5 +604,145 @@ async function changeInfo({ id, values = {}, country = '' }) {
   return { ok: false, message: tomTat, targets }
 }
 
-self.vaesaSmit = { changeInfo, fetchAdAccounts, fetchNoRoleAccounts, fetchHiddenLimit, fetchSpend, openCloseAccount, spendLimit, renameAccount }
+// ── Nhóm "Thẻ & thanh toán" — chép SMIT 1128.52251f38.js (10053 B / L, 85228 vZ, 87242 ey) + 1927 (17506 CK, 14845 UG) ──
+// Bản đọc mã: vaesa-livechat/docs/modules/smit/thanh-toan-2.md.
+const so5 = (id) => (String(id ?? '').match(/\d{5,}/) || [''])[0] // 1927 Sv: dãy ≥ 5 chữ số đầu tiên
+const laDoiTuong = (x) => x !== null && typeof x === 'object' && !Array.isArray(x)
+const ngu = (ms) => new Promise((r) => setTimeout(r, ms))
+// Đọc trả lời GraphQL như UG (1927:1922-1971): có errors[] mà các trường "một phần" còn trống mới là lỗi; ghep = mergeDeferred
+// (FB trả nhiều khúc JSON, khúc sau mang path + data ⇒ ghép vào khúc đầu).
+function docGraphql(t, { partial = [], ghep = false } = {}) {
+  const s = t.startsWith('for (;;);') ? t.slice(9) : t
+  let e
+  try {
+    if (ghep) {
+      const kh = s.split(/\s+(?={")/).map((x) => x.trim()).filter(Boolean)
+      e = JSON.parse(kh[0] ?? '')
+      for (const x of kh.slice(1)) {
+        let c
+        try { c = JSON.parse(x) } catch { continue }
+        if (Array.isArray(c.errors) && c.errors.length) e.errors = [...(e.errors ?? []), ...c.errors]
+        if (!Array.isArray(c.path) || !laDoiTuong(c.data)) continue
+        let r = e.data
+        for (const p of c.path) r = typeof r === 'object' && r !== null ? r[String(p)] : undefined
+        if (laDoiTuong(r)) Object.assign(r, c.data)
+      }
+    } else e = JSON.parse(s.includes('\n') ? (s.split('\n')[0] ?? '').trim() : s)
+  } catch { return { error: true, message: 'Phản hồi GraphQL không hợp lệ' } }
+  const du = partial.length > 0 && partial.every((p) => { let n = e; for (const k of p.split('.')) { if (typeof n !== 'object' || n === null) return false; n = n[k] } return n != null })
+  if (e.errors?.length && !du) {
+    const x = e.errors[0]
+    return { error: true, message: [x?.description_raw, x?.description, x?.summary, x?.message].find((v) => typeof v === 'string' && v.trim()) || 'GraphQL error', ...(typeof x?.code === 'number' ? { code: x.code } : {}) }
+  }
+  if (e.error) {
+    const code = typeof e.error === 'number' ? e.error : typeof e.code === 'number' ? e.code : undefined
+    return { error: true, message: e.errorDescription || e.errorSummary || String(e.error), ...(code !== undefined ? { code } : {}) }
+  }
+  return e
+}
+const loiPhien = (r) => r?.error && ([190, 102, 463, 467, 1357004].includes(r.code) || /fb_dtsg|access token|session|login|log in|logged in|đăng nhập/i.test(r.message || ''))
+// UG: www báo 1675002 ⇒ gọi lại qua business; lỗi giống hết phiên ⇒ lấy phiên mới, thử lại 1 lần.
+async function goiGraphql(host, form, opt = {}) {
+  const chay = async (token) => {
+    const goi = async (h) => {
+      const body = new URLSearchParams({ locale: 'en_US', __a: '1', ...form, fb_dtsg: token.fb_dtsg || '', lsd: token.lsd || '', ...(opt.them || {}) })
+      const res = await fetch(`https://${h}.facebook.com/api/graphql/`, { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-asbd-id': '1' }, body: body.toString() })
+      return docGraphql(await res.text(), opt)
+    }
+    let r = await goi(host)
+    if (host === 'www' && r.error && r.code === 1675002) r = await goi('business')
+    return r
+  }
+  const r = await chay(await getAdsToken())
+  return loiPhien(r) ? chay(await getAdsToken(true)) : r
+}
+async function lan3(f) { // 1927:183 / 1128:8478: tối đa 3 lần, nghỉ 800ms rồi 1600ms
+  let loi
+  for (let i = 0; i < 3; i++) {
+    try { return await f() } catch (e) { loi = e; if (e?.dung) throw e; if (i < 2) await ngu(Math.min(5000, 800 * (i + 1))) }
+  }
+  throw loi
+}
+const CHU_KHONG_TT = 'Tài khoản chưa có tài khoản thanh toán nên không có trạng thái hold'
+
+// Check Hold (B + ey): TK thanh toán theo TKQC (doc 6401661393282937) → cờ hạn chế (doc 6975887429148122).
+async function checkHold({ id }) {
+  const t = String(id ?? '').trim()
+  if (!t) return { ok: false, message: 'Thiếu ID tài khoản' }
+  const tk = await lan3(async () => {
+    const r = await goiGraphql('www', { doc_id: '6401661393282937', variables: JSON.stringify({ assetID: so5(t) }) }, { partial: ['data.billable_account_by_asset_id.formatted_dsl'] })
+    if (r.error) {
+      const e = new Error(r.code === 1675004 ? 'Hidden limit rate limited' : r.message)
+      if (r.code === 1675004 || r.code === 1675002) e.dung = true
+      throw e
+    }
+    return r.data?.billable_account_by_asset_id
+  })
+  const legacy = String(tk?.legacy_account_id ?? '').trim()
+  if (!legacy) return { ok: false, message: CHU_KHONG_TT }
+  const s = await lan3(async () => {
+    const r = await goiGraphql('www', { doc_id: '6975887429148122', variables: JSON.stringify({ paymentAccountID: legacy }) })
+    if (r.error) throw new Error(r.message)
+    return r.data?.billable_account_by_payment_account
+  })
+  if (!s) return { ok: false, message: CHU_KHONG_TT }
+  const holdNeed = s.prisk_restrictions?.length || s.is_reauth_restricted || s.is_sdc_restricted ? 'HOLD' : 'OK'
+  return { ok: true, message: holdNeed, patch: { holdNeed } }
+}
+
+// Check xác minh vị trí (L): cùng doc 6401661393282937 nhưng gọi thẳng business, kèm __aaid, ghép khúc; có tin VERIFY_COUNTRY ⇒ cần xác minh.
+async function checkLocation({ id }) {
+  const t = so5(id)
+  if (!t) return { ok: false, message: 'Thiếu ID tài khoản' }
+  const r = await goiGraphql('business', { doc_id: '6401661393282937', variables: JSON.stringify({ assetID: t }) },
+    { them: { __aaid: t }, partial: ['data.billable_account_by_asset_id.billing_hub_messages'], ghep: true })
+  if (r.error) return { ok: false, message: r.message }
+  const a = r.data?.billable_account_by_asset_id?.billing_hub_messages?.messages
+  if (!a) return { ok: false, message: 'Facebook không trả về tài khoản thanh toán nên không xác định được' }
+  if (a.some((m) => m?.primary_action?.wizard_name === 'VERIFY_COUNTRY')) return { ok: true, message: 'Cần xác minh vị trí kinh doanh', alert: true }
+  return { ok: true, message: 'Không bị yêu cầu xác minh vị trí' }
+}
+
+// Tải hoá đơn (vZ): trang tính sẵn đường dẫn + tên tệp; tiện ích đặt luật đổi tên tệp (sống 120 giây) rồi mở tab Facebook.
+// Facebook trả tệp theo phiên đăng nhập của trình duyệt; tiện ích không tải, không nén gì cả.
+const luatHoaDon = new Map()
+const henXoaLuat = new Map()
+let soLuat = 0
+async function openInvoices({ id, url, fileName }) {
+  const acc = boAct(id)
+  if (!luatHoaDon.has(acc)) luatHoaDon.set(acc, 940000000 + soLuat++)
+  const ruleId = luatHoaDon.get(acc)
+  const ascii = String(fileName).normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/đ/g, 'd').replace(/Đ/g, 'D').replace(/[^\x20-\x7e]/g, '_')
+  const ma = encodeURIComponent(fileName).replace(/['()]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)
+  let dat = false
+  try {
+    await chrome.declarativeNetRequest.updateSessionRules({
+      removeRuleIds: [ruleId],
+      addRules: [{ id: ruleId, priority: 1,
+        action: { type: 'modifyHeaders', responseHeaders: [{ header: 'Content-Disposition', operation: 'set', value: `attachment; filename="${ascii}"; filename*=UTF-8''${ma}` }] },
+        condition: { urlFilter: `||facebook.com/ads/manage/invoices_generator/?act=${acc}&`, resourceTypes: ['main_frame'] } }],
+    })
+    dat = true
+  } catch { /* SMIT: đặt luật lỗi vẫn mở tab — tệp giữ tên Facebook đặt */ }
+  if (dat) {
+    clearTimeout(henXoaLuat.get(acc))
+    henXoaLuat.set(acc, setTimeout(() => { chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [ruleId] }).catch(() => {}) }, 120000))
+  }
+  try {
+    await chrome.tabs.create({ url })
+    return { ok: true, message: 'Đã yêu cầu mở liên kết Facebook trong tab mới' }
+  } catch {
+    return { ok: false, message: 'VAESA Extension không thể mở tab tải xuống. Hãy kiểm tra extension rồi thử lại.' }
+  }
+}
+
+// Một cửa cho các công cụ mới (trang gọi FB_TOOL { fn, payload }) — đỡ phải thêm lệnh riêng cho từng công cụ.
+const CONG_CU = { 'check-hold': checkHold, 'check-location-verification': checkLocation, 'download-invoices': openInvoices }
+async function runTool(fn, payload) {
+  const f = CONG_CU[fn]
+  if (!f) return { ok: false, message: `Tiện ích chưa có chức năng ${fn} — cập nhật VAESA Extension` }
+  try { return await f(payload || {}) } catch (e) { return { ok: false, message: String(e?.message || e) } }
+}
+
+self.vaesaSmit = { changeInfo, fetchAdAccounts, fetchNoRoleAccounts, fetchHiddenLimit, fetchSpend, openCloseAccount, spendLimit, renameAccount, runTool }
 })()

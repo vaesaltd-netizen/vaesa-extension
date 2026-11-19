@@ -2459,6 +2459,11 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         return await self.vaesaSmit.changeInfo(req.payload || {})
       case 'VAESA_FB_RENAME':
         return await self.vaesaSmit.renameAccount(req.payload || {})
+      case 'VAESA_FB_TOOL': {
+        // Kết quả công cụ luôn bọc trong { ok:true, kq } để trang nhận được cả kết quả lỗi (ok:false) kèm câu Facebook.
+        const q = req.payload || {}
+        return { ok: true, kq: await self.vaesaSmit.runTool(q.fn, q.payload) }
+      }
       case 'VAESA_FB_SPEND': {
         const q = req.payload || {}
         return { ok: true, spend: await self.vaesaSmit.fetchSpend({ ids: q.ids || [], preset: q.preset, since: q.since, until: q.until }) }
