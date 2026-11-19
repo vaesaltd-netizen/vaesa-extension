@@ -936,9 +936,18 @@ async function payDebt({ id, values = {} }) {
   return { ok: false, message: `Thanh toán dư nợ thất bại với ${bonSo ? `thẻ ${bonSo}` : `${cards.length} thẻ`}: ${loi.join(' | ')}` }
 }
 
+// Mở trang thanh toán Facebook ở tab nền (lite:651-662 chrome.tabs.create active:false) — chỉ nhận đường dẫn facebook.com.
+async function openTab({ url }) {
+  let u
+  try { u = new URL(String(url)) } catch { return { ok: false, message: 'Đường dẫn không hợp lệ' } }
+  if (u.protocol !== 'https:' || !/(^|\.)facebook\.com$/i.test(u.hostname)) return { ok: false, message: 'Chỉ mở được trang facebook.com' }
+  await chrome.tabs.create({ url: u.toString(), active: false })
+  return { ok: true }
+}
+
 // Một cửa cho các công cụ mới (trang gọi FB_TOOL { fn, payload }) — đỡ phải thêm lệnh riêng cho từng công cụ.
 const CONG_CU = { 'check-hold': checkHold, 'check-location-verification': checkLocation, 'download-invoices': openInvoices,
-  'activate-prepay': activatePrepay, 'delete-card': deleteCard, 'set-default-card': setDefaultCard, 'pay-debt': payDebt }
+  'activate-prepay': activatePrepay, 'delete-card': deleteCard, 'set-default-card': setDefaultCard, 'pay-debt': payDebt, 'open-tab': openTab }
 async function runTool(fn, payload) {
   const f = CONG_CU[fn]
   if (!f) return { ok: false, message: `Tiện ích chưa có chức năng ${fn} — cập nhật VAESA Extension` }
