@@ -1116,6 +1116,93 @@ async function boostMePages() { // eT: Via + Page của Via (lọc ở trang)
   const pages = await docTrangGraph('/me/accounts', { fields: 'id,name,is_published,is_promotable,tasks,roles{id,tasks}', limit: 40, type: 'page' })
   return { ok: true, via: { id: e.id, name: e.name ?? e.id }, pages }
 }
+// ── Tab BM (SMIT 1128 module 86842 + 6747 module 48132/83418 + 8967 module 31089) — ≥ 3.12.34. Trang điều phối (nhiều BM,
+// nghỉ giữa các lượt như SMIT); tiện ích chỉ làm từng lệnh ĐỌC ngắn. Đổi dữ liệu thành dòng bảng ở trang (smitBm.js).
+const BM_GOC = 'id,name,is_disabled_for_integrity_reasons,sharing_eligibility_status,created_time,verification_status' // 6747:1008 r
+const BM_CHI_TIET = 'partner_relationships.limit(200){id,name},owned_pages.limit(200){id,name},client_pages.limit(200){id,name},owned_instagram_accounts.limit(200){id,username},client_instagram_accounts.limit(200){id,username},whatsapp_business_accounts.limit(200){id,name,verified_name,status},owned_ad_accounts.limit(200){id,account_id,account_status,adtrust_dsl,name},client_ad_accounts.limit(200){id,account_id,account_status,name},business_users.limit(300){id,name,role,backing_user_type}'
+const BM_CANH = ['partner_relationships', 'owned_pages', 'client_pages', 'owned_instagram_accounts', 'client_instagram_accounts', 'whatsapp_business_accounts', 'owned_ad_accounts', 'client_ad_accounts', 'business_users']
+async function graphLo(reqs) { // Graph batch (≤ 50): [{ code, body }] theo đúng thứ tự gửi
+  const r = await graphPost('', { include_headers: 'false', batch: JSON.stringify(reqs) })
+  if (r.loi) return { loi: r.loi }
+  if (!Array.isArray(r.j)) return { loi: 'Phản hồi Graph batch không hợp lệ' }
+  return { items: r.j.map((x) => { let body = null; try { body = x?.body ? JSON.parse(x.body) : null } catch { body = null } return { code: Number(x?.code), body } }) }
+}
+async function docTiepTrang(next, toiDa = 100) { // theo paging.next (8892-8933: tối đa 100 trang)
+  const out = []
+  let a = next, n = 0
+  while (a && n < toiDa) {
+    const r = await jbGoi(a)
+    if (r.error) break
+    out.push(...(r.data ?? []))
+    a = r.paging?.next
+    n += 1
+  }
+  return out
+}
+async function bmList({ after } = {}) { // /me/businesses v25.0, 50/trang, có permitted_roles
+  const r = await jbGoi('/me/businesses', { version: 'v25.0', params: { fields: `${BM_GOC},permitted_roles`, limit: '50', ...(after ? { after } : {}) } })
+  if (r.error) return { ok: false, message: r.message, code: r.code }
+  return { ok: true, data: r.data ?? [], after: r.paging?.next ? r.paging?.cursors?.after ?? null : null }
+}
+async function bmRoles() { // /me/business_users?fields=role,business{id}&limit=200 v25.0 — vai trò khi tải theo ID
+  const out = {}
+  let r = await jbGoi('/me/business_users', { version: 'v25.0', params: { fields: 'role,business{id}', limit: '200' } })
+  for (let n = 0; n < 100 && r && !r.error; n += 1) {
+    for (const u of r.data ?? []) { const id = String(u.business?.id ?? ''); if (id) (out[id] ||= []).push(String(u.role ?? '')) }
+    r = r.paging?.next ? await jbGoi(r.paging.next) : null
+  }
+  if (r?.error) return { ok: false, message: r.message }
+  return { ok: true, roles: out }
+}
+async function bmChiTiet({ ids, kemGoc = false }) { // lô ≤ 50 BM: các cạnh chi tiết (+ trường gốc khi tải theo ID), đọc tiếp trang
+  const ds = (ids || []).map(String).slice(0, 50)
+  const f = kemGoc ? `${BM_GOC},${BM_CHI_TIET}` : BM_CHI_TIET
+  const b = await graphLo(ds.map((id) => ({ method: 'GET', relative_url: `${id}?fields=${encodeURIComponent(f)}` })))
+  if (b.loi) return { ok: false, message: b.loi }
+  const items = {}
+  for (let i = 0; i < ds.length; i += 1) {
+    const id = ds[i], it = b.items[i]
+    const node = it?.body
+    if (!node || node.error || it.code >= 400) { items[id] = { ok: false, message: node?.error?.message || `Lỗi ${it?.code ?? ''}`.trim(), code: node?.error?.code }; continue }
+    for (const k of BM_CANH) if (node[k]?.paging?.next) node[k] = { data: [...(node[k].data ?? []), ...(await docTiepTrang(node[k].paging.next))], paging: {} }
+    items[id] = { ok: true, node }
+  }
+  return { ok: true, items }
+}
+async function bmAdminAn({ ids }) { // 9181-9212: system_users có app được gán = admin ẩn
+  const ds = (ids || []).map(String).slice(0, 50)
+  const b = await graphLo(ds.map((id) => ({ method: 'GET', relative_url: `${id}/system_users?fields=${encodeURIComponent('id,name,assigned_apps.limit(100){id,name}')}&limit=300` })))
+  if (b.loi) return { ok: false, message: b.loi }
+  const items = {}
+  ds.forEach((id, i) => { const body = b.items[i]?.body; items[id] = body && !body.error ? { ok: true, data: body.data ?? [] } : { ok: false, message: body?.error?.message || 'Lỗi' } })
+  return { ok: true, items }
+}
+async function bmTrangThai() { // 6747:818-827: GraphQL business doc 4941582179260904 — một lần mỗi lượt tải
+  const r = await graphql('business', { doc_id: '4941582179260904', variables: JSON.stringify({}) })
+  if (r.loi) return { ok: false, message: r.loi }
+  return { ok: true, nodes: r.json?.data?.viewer?.ad_businesses?.nodes ?? [] }
+}
+async function bmLoai({ id }) { // 8967 31089: graph.facebook.com/v24.0/graphql doc 32061067960207573 → ad_account_creation_limit
+  const token = await getAdsToken()
+  if (!token?.access_token) return { ok: true, bmId: id }
+  const q = new URLSearchParams({ access_token: token.access_token, format: 'json', pretty: '0', suppress_http_code: '1', locale: 'en_US' })
+  const res = await fetch(`https://graph.facebook.com/v24.0/graphql?${q}`, { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ doc_id: '32061067960207573', variables: JSON.stringify({ businessID: String(id), overridePrimaryBusinessLocationEligibility: false }) }).toString() })
+  const t = await res.text()
+  if (!t.includes('BusinessCometBizSuiteSettingsBusinessInfoV3ViewContainerQuery')) return { ok: true, bmId: id }
+  for (const k of t.split(/\s+(?={")/)) {
+    const x = k.trim()
+    if (!x) continue
+    try { const n = JSON.parse(x)?.data?.ad_account_creation_limit; if (typeof n === 'number' && Number.isFinite(n)) return { ok: true, bmId: id, bmType: n } } catch { /* khúc khác */ }
+  }
+  return { ok: true, bmId: id }
+}
+async function bmKhang({ id }) { // 1128:9218-9264: GraphQL business doc 24196151083363204 — trang đổi thành các ô kháng nghị
+  const r = await graphql('business', { doc_id: '24196151083363204', variables: JSON.stringify({ assetOwnerId: String(id) }) })
+  if (r.loi) return { ok: false, message: r.loi }
+  return { ok: true, data: r.json?.data?.assetOwnerData ?? null }
+}
+
 // VIA của trình duyệt này (500:343-363 v()): Graph /me id,name,picture.width(100){url} bằng mã đọc — tab VIA (≥ 3.12.33).
 async function viaMe() {
   const e = await jbGoi('/me', { params: { fields: 'id,name,picture.width(100){url}' } })
@@ -1197,7 +1284,8 @@ async function openTab({ url }) {
 const CONG_CU = { 'check-hold': checkHold, 'check-location-verification': checkLocation, 'download-invoices': openInvoices,
   'activate-prepay': activatePrepay, 'delete-card': deleteCard, 'set-default-card': setDefaultCard, 'pay-debt': payDebt, 'open-tab': openTab,
   'import-campaign-xlsx': importXlsx, 'boost-gql': boostGql, 'boost-session': boostSession, 'boost-me-pages': boostMePages,
-  'boost-currency': boostCurrency, 'boost-page-posts': boostPagePosts, 'boost-publish': boostPublish, 'via-me': viaMe }
+  'boost-currency': boostCurrency, 'boost-page-posts': boostPagePosts, 'boost-publish': boostPublish, 'via-me': viaMe,
+  'bm-list': bmList, 'bm-roles': bmRoles, 'bm-chi-tiet': bmChiTiet, 'bm-admin-an': bmAdminAn, 'bm-trang-thai': bmTrangThai, 'bm-loai': bmLoai, 'bm-khang': bmKhang }
 async function runTool(fn, payload) {
   const f = CONG_CU[fn]
   if (!f) return { ok: false, message: `Tiện ích chưa có chức năng ${fn} — cập nhật VAESA Extension` }
