@@ -1,4 +1,7 @@
 // VAESA Extension v3.0.0 — service worker.
+
+// Màn Smit (danh sách TKQC Facebook) — self.vaesaSmit.
+importScripts('smit.js')
 //
 // Port verbatim từ Retion 0.2.3.1 (EXT-0.2.3.1).
 // Source: chrome-extension/src/background/background/facebook/{user,client,page}.ts
@@ -2436,6 +2439,16 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
       }
       case 'VAESA_CRAWL_MBS':
         return await actionCrawlMbs(req.payload || {})
+      // ── Màn Smit: danh sách TKQC ──
+      case 'VAESA_FB_ADACCOUNTS': {
+        const r = await self.vaesaSmit.fetchAdAccounts({ payment: req.payload?.payment !== false })
+        return { ok: true, accounts: r.accounts, user: r.token }
+      }
+      case 'VAESA_FB_HIDDEN_LIMIT': {
+        const id = req.payload?.asset_id
+        if (!id) return { ok: false, error: 'Thiếu asset_id' }
+        return { ok: true, asset_id: id, limit: await self.vaesaSmit.fetchHiddenLimit(id, req.payload?.currency) }
+      }
       default:
         return { ok: false, error: 'Unknown action: ' + req?.action }
     }

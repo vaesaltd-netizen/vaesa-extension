@@ -41,6 +41,8 @@ const ACTION_MAP = {
   DEBUG_PC_CTX: 'VAESA_DEBUG_PC_CTX',
   DEBUG_INBOX_HTML: 'VAESA_DEBUG_INBOX_HTML',
   CRAWL_MBS: 'VAESA_CRAWL_MBS',
+  FB_ADACCOUNTS: 'VAESA_FB_ADACCOUNTS',
+  FB_HIDDEN_LIMIT: 'VAESA_FB_HIDDEN_LIMIT',
 }
 
 // Background → page push (sync progress, MQTT events...). Forward sang webapp qua postMessage.
