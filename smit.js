@@ -448,5 +448,161 @@ async function renameAccount({ id, name }) {
   return { ok: true, message: `Đã đổi tên → ${name}`, patch: { name } }
 }
 
-self.vaesaSmit = { fetchAdAccounts, fetchNoRoleAccounts, fetchHiddenLimit, fetchSpend, openCloseAccount, spendLimit, renameAccount }
+// Đổi thông tin của TKQC — SMIT 1128 module 26429 (K) + 24085 + 37324 (spin), bản đọc: docs/modules/smit/doi-thong-tin-tkqc.md §4–6.
+// Giữ ID: chạy lần lượt Múi giờ → Tiền tệ → Thông tin doanh nghiệp/Quốc gia (mỗi phần cách 1–3 giây).
+// ĐỔI ID: một lệnh GraphQL tạo TKQC mới mang quốc gia/tiền tệ/múi giờ/thông tin đã chọn (không trả patch).
+const CI_GIU = '__keep__'
+const CI_CHU = ['businessName', 'taxId', 'street1', 'street2', 'city', 'state', 'zip']
+const CI_NHAN = { businessName: 'Tên', street1: 'Địa chỉ 1', street2: 'Địa chỉ 2', city: 'Thành phố', state: 'Bang', zip: 'Zip', taxId: 'MST' }
+const CI_DICH = { timezone: 'Múi giờ', currency: 'Loại tiền tệ', country: 'Quốc gia', businessInfo: 'Thông tin doanh nghiệp', newId: 'Đổi ID' }
+const BANG_MY = { alabama: 'AL', alaska: 'AK', arizona: 'AZ', arkansas: 'AR', california: 'CA', colorado: 'CO', connecticut: 'CT', delaware: 'DE', 'district of columbia': 'DC', florida: 'FL', georgia: 'GA', hawaii: 'HI', idaho: 'ID', illinois: 'IL', indiana: 'IN', iowa: 'IA', kansas: 'KS', kentucky: 'KY', louisiana: 'LA', maine: 'ME', maryland: 'MD', massachusetts: 'MA', michigan: 'MI', minnesota: 'MN', mississippi: 'MS', missouri: 'MO', montana: 'MT', nebraska: 'NE', nevada: 'NV', 'new hampshire': 'NH', 'new jersey': 'NJ', 'new mexico': 'NM', 'new york': 'NY', 'north carolina': 'NC', 'north dakota': 'ND', ohio: 'OH', oklahoma: 'OK', oregon: 'OR', pennsylvania: 'PA', 'rhode island': 'RI', 'south carolina': 'SC', 'south dakota': 'SD', tennessee: 'TN', texas: 'TX', utah: 'UT', vermont: 'VT', virginia: 'VA', washington: 'WA', 'west virginia': 'WV', wisconsin: 'WI', wyoming: 'WY' }
+const ciCo = (v, k) => (typeof v[k] === 'string' ? v[k].trim() : '')
+const ciQG = (v) => { const c = ciCo(v, 'countryCode').toUpperCase(); return c && c !== '__KEEP__' ? c : '' }
+const ciCoChu = (v) => CI_CHU.some((k) => ciCo(v, k) !== '')
+const ciMG = (v) => { const z = ciCo(v, 'timezoneName'); return z !== '' && z !== CI_GIU }
+const ciTT = (v) => { const z = ciCo(v, 'currency'); return z !== '' && z !== CI_GIU }
+const ciDoiId = (v) => v.changeId === true || v.changeId === 'true'
+const ngauNhien = (a, b) => a + Math.floor(Math.random() * (b - a + 1))
+const nghiCi = () => new Promise((r) => setTimeout(r, 1000 + Math.floor(2001 * Math.random())))
+function ciSpin(s) {
+  let x = String(s ?? '')
+  for (let g = 0; g < 100; g++) {
+    const m = x.match(/{([^{}]+?)}/)
+    if (!m) break
+    const p = m[1].split('|')
+    x = x.replace(m[0], p[Math.floor(Math.random() * p.length)])
+  }
+  return x
+}
+function bangMy(x) {
+  const t = String(x || '').trim()
+  if (!t) return t
+  const k = BANG_MY[t.toLowerCase().replace(/\s+/g, ' ')]
+  if (k) return k
+  const hoa = t.toUpperCase()
+  return Object.values(BANG_MY).includes(hoa) ? hoa : t
+}
+const ciTachMG = (tz) => { const i = String(tz).indexOf('|'); return i < 0 ? { id: String(tz).trim(), timezone: String(tz).trim() } : { id: tz.slice(0, i).trim(), timezone: tz.slice(i + 1).trim() } }
+const ciLog = () => ({ logging_counter: ngauNhien(10, 40), logging_id: `1017${ngauNhien(500000, 700000)}` })
+function ciThue(v, qg) {
+  return {
+    business_address: {
+      country_code: qg,
+      city: ciSpin(ciCo(v, 'city')),
+      state: qg === 'US' ? bangMy(ciSpin(ciCo(v, 'state'))) : ciSpin(ciCo(v, 'state')),
+      street1: ciSpin(ciCo(v, 'street1')),
+      street2: ciSpin(ciCo(v, 'street2')),
+      zip: ciSpin(ciCo(v, 'zip')),
+    },
+    business_name: ciSpin(ciCo(v, 'businessName')),
+    is_personal_use: typeof v.isPersonalUse === 'boolean' ? v.isPersonalUse : v.isPersonalUse === 'true',
+    tax_id: ciSpin(ciCo(v, 'taxId')),
+    tax_registration_status: '',
+  }
+}
+// Graph REST như SMIT JB: POST act_X với tham số method=POST (+ định dạng chuẩn).
+async function ciGraph(acc, params) {
+  const r = await graphPost(`act_${acc}`, { method: 'POST', ...params, format: 'json', pretty: '0', suppress_http_code: '1', locale: 'en_US' })
+  return r
+}
+async function ciMuiGio(acc, tz) {
+  const { id, timezone } = ciTachMG(tz)
+  const r = await ciGraph(acc, { timezone_id: id })
+  if (r.loi) return { part: 'timezone', ok: false, message: r.loi }
+  return r.j?.success === true ? { part: 'timezone', ok: true, message: `Múi giờ ${timezone}` } : { part: 'timezone', ok: false, message: 'Facebook không xác nhận đổi timezone' }
+}
+async function ciTienTe(acc, ma) {
+  const r = await ciGraph(acc, { currency: ma })
+  if (r.loi) return { part: 'currency', ok: false, message: r.loi }
+  return r.j?.success === true ? { part: 'currency', ok: true, message: `Tiền tệ ${ma}` } : { part: 'currency', ok: false, message: 'Facebook không xác nhận đổi tiền tệ' }
+}
+async function ciThongTin(acc, thue, actor) {
+  const r = await graphql('business', {
+    doc_id: '5664358410294804',
+    variables: JSON.stringify({ input: { billable_account_payment_legacy_account_id: acc, currency: null, timezone: null, logging_data: ciLog(), tax: { ...thue, second_tax_id: '' }, actor_id: actor, client_mutation_id: String(ngauNhien(1, 30)) } }),
+  })
+  if (r.loi) return { part: 'info', ok: false, message: r.loi, sentTax: thue }
+  return r.json?.data?.billable_account_update?.billable_account?.id ? { part: 'info', ok: true, message: '', sentTax: thue } : { part: 'info', ok: false, message: 'Facebook không xác nhận đổi thông tin', sentTax: thue }
+}
+async function ciIdMoi(acc, v, actor, phan, qg) {
+  const r = await graphql('business', {
+    doc_id: '4831122253676348',
+    variables: JSON.stringify({ input: {
+      current_payment_legacy_account_id: acc,
+      logging_data: ciLog(),
+      new_country_code: qg,
+      new_currency_code: phan.includes('currency') ? ciCo(v, 'currency').toUpperCase() : null,
+      new_timezone: phan.includes('timezone') && ciCo(v, 'timezoneName') ? ciTachMG(ciCo(v, 'timezoneName')).timezone : null,
+      new_tax: { ...ciThue(v, qg), tax_id_type: 'NONE' },
+      actor_id: actor,
+      client_mutation_id: String(ngauNhien(1, 30)),
+    } }),
+  })
+  if (r.loi) return { ok: false, message: r.loi }
+  const d = r.json?.data?.new_billable_account_from_old
+  const id = d?.id ?? d?.billable_account?.id
+  return id ? { ok: true, message: `Đã tạo TKQC ID mới ${id}. Hãy quét lại danh sách để cập nhật cache.` } : { ok: false, message: 'Facebook không xác nhận tạo TKQC ID mới' }
+}
+const ciDich = (id, r) => ({ id, displayId: CI_DICH[id], ok: r.ok, message: r.message })
+async function changeInfo({ id, values = {}, country = '' }) {
+  const v = Object.fromEntries(Object.entries(values || {}).filter(([, x]) => typeof x === 'string' || typeof x === 'boolean'))
+  const acc = boAct(id)
+  if (!acc) return { ok: false, message: 'Thiếu ID tài khoản' }
+  const phan = [ciMG(v) && 'timezone', ciTT(v) && 'currency', (ciQG(v) || ciCoChu(v)) && 'info'].filter(Boolean)
+  const qgCu = String(country || '').trim().toUpperCase()
+  const qg = ciQG(v) || qgCu
+  if (ciDoiId(v)) {
+    const loi = !phan.length ? 'Chọn ít nhất một phần cần đổi khi thay đổi ID TKQC' : !qg ? 'Thiếu mã quốc gia để đổi ID mới'
+      : phan.includes('currency') && !ciCo(v, 'currency') ? 'Thiếu tiền tệ' : phan.includes('timezone') && !ciCo(v, 'timezoneName') ? 'Thiếu múi giờ' : null
+    if (loi) return { ok: false, message: loi }
+    const tk = await getAdsToken()
+    const r = await ciIdMoi(acc, v, tk.user_id, phan, qg)
+    return { ...r, targets: [ciDich('newId', r)] }
+  }
+  const loi = !phan.length ? 'Chọn ít nhất một phần cần đổi khi giữ ID'
+    : phan.includes('currency') && !ciCo(v, 'currency') ? 'Thiếu tiền tệ' : phan.includes('timezone') && !ciCo(v, 'timezoneName') ? 'Thiếu múi giờ'
+      : phan.includes('info') && !qg ? 'Thiếu mã quốc gia' : null
+  if (loi) return { ok: false, message: loi }
+  const tk = await getAdsToken()
+  const targets = [], patch = {}
+  for (let i = 0; i < phan.length; i++) {
+    if (i > 0) await nghiCi()
+    if (phan[i] === 'timezone') {
+      const r = await ciMuiGio(acc, ciCo(v, 'timezoneName'))
+      targets.push(ciDich('timezone', r))
+      if (r.ok) patch.timezone_name = ciTachMG(ciCo(v, 'timezoneName')).timezone
+    } else if (phan[i] === 'currency') {
+      const ma = ciCo(v, 'currency').toUpperCase()
+      const r = await ciTienTe(acc, ma)
+      targets.push(ciDich('currency', r))
+      if (r.ok) patch.currency = ma
+    } else {
+      const chonQG = ciQG(v) !== '', coChu = ciCoChu(v)
+      const res = await ciThongTin(acc, ciThue(v, qg), tk.user_id)
+      let p = res, qgDung = qg
+      // Thử lại với quốc gia cũ của TKQC khi đổi quốc gia + thông tin bị từ chối (26429 N()).
+      if (!res.ok && chonQG && coChu && res.sentTax && qgCu && qgCu !== qg) {
+        await nghiCi()
+        p = await ciThongTin(acc, { ...res.sentTax, business_address: { ...res.sentTax.business_address, country_code: qgCu } }, tk.user_id)
+        qgDung = qgCu
+      }
+      if (chonQG) targets.push(ciDich('country', res.ok ? { ok: true, message: `Quốc gia ${qg}` } : res))
+      if (coChu) {
+        const t = p.sentTax
+        const chiTiet = t ? [['businessName', t.business_name], ['street1', t.business_address.street1], ['street2', t.business_address.street2], ['city', t.business_address.city], ['state', t.business_address.state], ['zip', t.business_address.zip], ['taxId', t.tax_id]]
+          .filter(([, x]) => x).map(([k, x]) => `${CI_NHAN[k]}: ${x}`).join(' · ') : ''
+        targets.push(ciDich('businessInfo', p.ok && p.sentTax ? { ok: true, message: chiTiet } : p))
+      }
+      if (p.ok && p.sentTax) { patch.business_country_code = qgDung; patch.business_state = p.sentTax.business_address.state; patch.business_zip = p.sentTax.business_address.zip }
+    }
+  }
+  const tomTat = targets.map((t) => (t.ok ? `${t.id}: OK` : `${t.id}: FAIL (${t.message})`)).join('; ')
+  const okHet = targets.every((t) => t.ok), okMot = targets.some((t) => t.ok)
+  const coPatch = Object.keys(patch).length > 0
+  if (okHet) return { ok: true, message: tomTat, targets, ...(coPatch ? { patch } : {}) }
+  if (okMot) return { ok: false, message: `PARTIAL — ${tomTat}`, targets, ...(coPatch ? { patch } : {}) }
+  return { ok: false, message: tomTat, targets }
+}
+
+self.vaesaSmit = { changeInfo, fetchAdAccounts, fetchNoRoleAccounts, fetchHiddenLimit, fetchSpend, openCloseAccount, spendLimit, renameAccount }
 })()

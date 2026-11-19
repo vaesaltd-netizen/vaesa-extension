@@ -2455,6 +2455,8 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         const r = await self.vaesaSmit.fetchNoRoleAccounts(req.payload || {})
         return { ok: true, accounts: r.accounts, user: r.token }
       }
+      case 'VAESA_FB_CHANGE_INFO':
+        return await self.vaesaSmit.changeInfo(req.payload || {})
       case 'VAESA_FB_RENAME':
         return await self.vaesaSmit.renameAccount(req.payload || {})
       case 'VAESA_FB_SPEND': {
