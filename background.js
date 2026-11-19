@@ -2451,6 +2451,8 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         return await self.vaesaSmit.openCloseAccount(req.payload || {})
       case 'VAESA_FB_SPEND_LIMIT':
         return await self.vaesaSmit.spendLimit(req.payload || {})
+      case 'VAESA_FB_NO_ROLE':
+        return await self.vaesaSmit.fetchNoRoleAccounts(req.payload || {})
       case 'VAESA_FB_RENAME':
         return await self.vaesaSmit.renameAccount(req.payload || {})
       case 'VAESA_FB_SPEND': {

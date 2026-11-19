@@ -217,24 +217,11 @@ async function fetchAdAccounts({ payment = true, source = 'all', tkqcIds = '', b
       }
       return [...byId.values()]
     }
-    // 1) TKQC cá nhân của user.
-    const me = await graphGet('me/adaccounts', { fields, limit: PAGE_LIMIT }, token.access_token)
-    // 2) Danh sách BM user có vai trò → owned + client ad accounts.
-    const bizRes = await graphGet('me/businesses', { fields: 'id,name', limit: '500' }, token.access_token)
-    const bizs = bizRes.data || []
+    // Danh sách chính = TKQC user CÓ QUYỀN (GET /{uid}/adaccounts, SMIT 1998 k/q — hasRole). TKQC chỉ thấy qua BM mà không có
+    // quyền thuộc mục "Tài khoản quảng cáo không có quyền" (fetchNoRoleAccounts), không gộp vào đây.
+    const me = await graphGet(`${token.user_id || 'me'}/adaccounts`, { fields, limit: PAGE_LIMIT }, token.access_token)
     const byId = new Map()
     for (const a of me.data || []) byId.set(a.account_id || a.id, a)
-    for (const b of bizs) {
-      for (const edge of ['owned_ad_accounts', 'client_ad_accounts']) {
-        try {
-          const r = await graphGet(`${b.id}/${edge}`, { fields, limit: PAGE_LIMIT }, token.access_token)
-          for (const a of r.data || []) {
-            const k = a.account_id || a.id
-            if (!byId.has(k)) byId.set(k, { ...a, __bm: { id: b.id, name: b.name } })
-          }
-        } catch (e) { /* BM lẻ lỗi quyền — bỏ qua, không chặn cả danh sách */ }
-      }
-    }
     return [...byId.values()]
   }
   let raw
@@ -253,6 +240,53 @@ async function fetchAdAccounts({ payment = true, source = 'all', tkqcIds = '', b
     }),
     token: { user_id: token.user_id, user_name: token.user_name },
   }
+}
+
+// TKQC "không có quyền" — SMIT 1998 z()/U()/C(): TKQC thấy qua BM của user (owned + client) TRỪ TKQC user có quyền
+// (/{uid}/adaccounts). Quét BM theo lô 50 bằng Graph batch, mỗi BM lấy tối đa 5000 TK/loại (không phân trang, như SMIT);
+// BM nào bị từ chối thì bỏ qua. Lọc loại TK: bm = chỉ TK của BM; personal = TK không có owner_business (TK client).
+async function fetchNoRoleAccounts({ payment = true, accountType = 'all' } = {}) {
+  let token = await getAdsToken()
+  const fields = buildFields({ payment })
+  const run = async () => {
+    const me = await graphGet(`${token.user_id || 'me'}/adaccounts`, { fields: 'name,account_id,account_status,currency,owner_business', limit: '50', summary: '1' }, token.access_token)
+    const coQuyen = new Set((me.data || []).map((a) => tachId(a.account_id || a.id)[0]).filter(Boolean))
+    const bizs = (await graphGet('me/businesses', { fields: 'id,name', limit: '100' }, token.access_token)).data || []
+    const F = 'name,owned_ad_accounts.limit(5000){account_id,name,account_status,currency},client_ad_accounts.limit(5000){account_id,name,account_status,currency}'
+    const thay = new Map()
+    for (let i = 0; i < bizs.length; i += 50) {
+      const lo = bizs.slice(i, i + 50)
+      const r = await graphPost('', { include_headers: 'false', batch: JSON.stringify(lo.map((b) => ({ method: 'GET', relative_url: `${b.id}?fields=${encodeURIComponent(F)}` }))) })
+      const arr = Array.isArray(r.j) ? r.j : []
+      lo.forEach((b, k) => {
+        const it = arr[k]
+        if (!it || Number(it.code) >= 400) return
+        let body
+        try { body = JSON.parse(it.body) } catch { return }
+        if (!body || body.error) return
+        for (const a of body.owned_ad_accounts?.data || []) {
+          const id = tachId(a.account_id || a.id)[0]
+          if (id && !thay.has(id)) thay.set(id, { ...a, owner_business: a.owner_business || { id: b.id, name: body.name || b.name } })
+        }
+        for (const a of body.client_ad_accounts?.data || []) {
+          const id = tachId(a.account_id || a.id)[0]
+          if (id && !thay.has(id)) thay.set(id, a)
+        }
+      })
+    }
+    let ids = [...thay.keys()].filter((id) => !coQuyen.has(id))
+    if (accountType === 'personal') ids = ids.filter((id) => !thay.get(id)?.owner_business?.id)
+    if (!ids.length) return []
+    const r = await graphIds(ids.map((x) => `act_${x}`), fields, token.access_token)
+    return Object.values(r).filter((a) => a && !a.error)
+  }
+  let raw
+  try {
+    raw = await run()
+  } catch (e) {
+    if (String(e.message).includes('hết hạn')) { token = await getAdsToken(true); raw = await run() } else throw e
+  }
+  return { accounts: raw.map((a) => ({ ...mapAccount(a, token.user_id), hasRole: false })), token: { user_id: token.user_id, user_name: token.user_name } }
 }
 
 // PUBLIC: Limit ẩn (ngưỡng chi tiêu ẩn) cho 1 TKQC — lệnh GraphQL riêng, gọi lười.
@@ -414,5 +448,5 @@ async function renameAccount({ id, name }) {
   return { ok: true, message: `Đã đổi tên → ${name}`, patch: { name } }
 }
 
-self.vaesaSmit = { fetchAdAccounts, fetchHiddenLimit, fetchSpend, openCloseAccount, spendLimit, renameAccount }
+self.vaesaSmit = { fetchAdAccounts, fetchNoRoleAccounts, fetchHiddenLimit, fetchSpend, openCloseAccount, spendLimit, renameAccount }
 })()
