@@ -1766,6 +1766,251 @@ async function pageKichHoat({ profileId }) { // 86817 MG(): www.facebook.com Rea
   return l.data?.reactivate_profile?.id !== profileId ? { ok: false, message: 'không xác nhận được Page đã kích hoạt (thiếu data)' } : { ok: true, message: 'đã kích hoạt lại' }
 }
 
+// ── Kho chức năng tab Page (SMIT 1128 module 78305 runner Page + 36763 giới hạn trang + 86630 bài viết; docs/modules/smit/cong-cu-page.md)
+// — ≥ 3.12.38. Chỉ các công cụ KHÔNG cần đổi danh tính sang Page (fetch-as-actor của SMIT Connect — bản mã không có): tạo Page, bài viết,
+// giới hạn trang (trừ gỡ giới hạn quốc gia), đổi thông tin, kích hoạt Page bị vô hiệu hoá. Mã Page giữ trong tiện ích (không đưa ra trang).
+const nhoMaPage = new Map() // pageId → Page access token (94169 z)
+async function maPageCua(pageId) {
+  if (nhoMaPage.has(pageId)) return nhoMaPage.get(pageId)
+  for (const f of ['access_token', 'additional_profile_id,access_token']) {
+    const r = await jbGoi(`/${pageId}`, { params: { fields: f } })
+    if (!r.error && r.access_token) { nhoMaPage.set(pageId, r.access_token); return r.access_token }
+  }
+  return null
+}
+const CHU_KHONG_MA_PAGE = 'không lấy được Page access token (Via cần quyền quản trị Page)'
+const docJsonPage = (t) => { try { return JSON.parse(String(t).startsWith('for (;;);') ? String(t).slice(9) : t) } catch { return undefined } }
+async function pageMeTkqc() { // ec() 1128:17505-17512: TKQC đầu tiên của tài khoản (gửi kèm __aaid cho API 1)
+  const r = await jbGoi('/me/adaccounts', { params: { limit: '1' } })
+  return { ok: true, adAccountId: r.error ? null : r.data?.[0]?.account_id ?? null }
+}
+async function taoPageApi1(name, o) { // ed 1128:17513-17594: adsmanager.facebook.com/ads/page/create/
+  let tk
+  try { tk = await getAdsToken() } catch { tk = {} }
+  if (!tk.fb_dtsg || !tk.user_id) return { ok: false, message: 'thiếu phiên Facebook (fb_dtsg/user_id)' }
+  let t
+  try {
+    const q = new URLSearchParams({ name, 'categories[0]': o.categoryId || '199236533423806', profile_photo_id: '', description: o.bio ?? '', ads_manager_write_regions: 'true', __a: '1' })
+    const body = new URLSearchParams({ __aaid: o.adAccountId, __user: tk.user_id, __a: '1', dpr: '1', __ccg: 'UNKNOWN', __comet_req: '58', fb_dtsg: tk.fb_dtsg, jazoest: jazoest(tk.fb_dtsg), lsd: tk.lsd || '', __spin_b: 'trunk', __jssesw: '1' }).toString()
+    t = await (await fetch(`https://adsmanager.facebook.com/ads/page/create/?${q}`, { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-asbd-id': '1' }, body })).text()
+  } catch (e) { return { ok: false, unverified: true, message: `Không rõ API 1 đã tạo Page chưa (${e?.message || e}) — kiểm tra danh sách Page trước khi chạy lại` } }
+  const b = t.startsWith('for (;;);') ? t.slice(9) : t
+  if (!b.trim()) return { ok: false, message: 'Facebook chặn tạo Page (checkpoint)' }
+  const j = docJsonPage(b)
+  if (j === undefined) return { ok: false, unverified: true, message: 'Không rõ API 1 đã tạo Page chưa (phản hồi Ads Manager không hợp lệ) — kiểm tra danh sách Page trước khi chạy lại' }
+  const id = j?.payload?.page_id
+  if (id) return { ok: true, pageId: String(id), message: `đã tạo Page ${id}` }
+  return { ok: false, message: j?.errorDescription || j?.errorSummary || 'không xác nhận được Page mới (thiếu payload.page_id)' }
+}
+async function taoPageApi2(name, o, userId, so) { // em 1128:17595-17648: AdditionalProfilePlusCreationMutation (www, relayFields, av/__user)
+  const r = await goiGraphql('www', { fb_api_req_friendly_name: 'AdditionalProfilePlusCreationMutation', doc_id: '23863457623296585',
+    variables: JSON.stringify({ input: { bio: o.bio ?? '', categories: [o.categoryId || '199236533423806'], creation_source: 'comet', name, off_platform_creator_reachout_id: null,
+      page_referrer: 'pages_tab_launch_point_unified_creation', actor_id: userId, client_mutation_id: String(so) } }) }, { them: relayBm({ av: userId, __user: userId }) })
+  if (r.error) return { ok: false, message: r.message }
+  const x = r.data?.additional_profile_plus_create
+  if (x?.page?.id) return { ok: true, pageId: String(x.page.id), message: `đã tạo Page ${x.page.id}` }
+  const loi = (v) => (typeof v === 'string' ? v : v?.message || v?.summary || '')
+  return { ok: false, message: loi(x?.error_message) || loi(x?.name_error) || 'không xác nhận được Page mới (thiếu page.id)' }
+}
+async function pageTao({ name, adAccountId, bio, categoryId, so = 1 }) { // eg 1128:17649-17661: API 1 (có TKQC) rồi API 2
+  const ten = String(name ?? '').trim()
+  if (!ten) return { ok: false, message: 'tên Page rỗng' }
+  const tk = await getAdsToken()
+  if (!tk.user_id) return { ok: false, message: 'chưa đăng nhập Facebook' }
+  const o = { bio: bio || undefined, categoryId: categoryId || undefined, adAccountId }
+  if (adAccountId) {
+    const a = await taoPageApi1(ten, o)
+    if (a.ok || a.unverified) return a
+    await ngu(1000 + Math.floor(2001 * Math.random()))
+  }
+  return taoPageApi2(ten, o, tk.user_id, so)
+}
+async function pageBaiDs({ pageId, kind, limit = 20, skip = 0 }) { // 86630 CM (6747:139-164): mã Page → danh sách ID bài (tối đa skip+limit)
+  const t = await maPageCua(pageId)
+  if (!t) return { ok: false, message: CHU_KHONG_MA_PAGE }
+  const start = kind === 'all' ? 0 : skip, max = kind === 'all' ? Infinity : skip + limit
+  const ids = []
+  let sau = ''
+  for (let n = 0; n < 200 && ids.length < max; n += 1) {
+    const q = new URLSearchParams({ fields: 'id', limit: '100', access_token: t, suppress_http_code: '1' })
+    if (sau) q.set('after', sau)
+    let a
+    try { a = JSON.parse(await (await fetch(`https://graph.facebook.com/v25.0/${pageId}/posts?${q}`, { credentials: 'include' })).text()) } catch { break }
+    if (a.error) break
+    for (const e of a.data ?? []) if (e.id && ids.length < max) ids.push(String(e.id))
+    const c = a.paging?.cursors?.after
+    if (!a.paging?.next || !c || (a.data?.length ?? 0) === 0) break
+    sau = c
+  }
+  return { ok: true, listed: ids.length, ids: ids.slice(start) }
+}
+async function pageBaiXoa({ pageId, postId }) { // 86630 h(): DELETE /v24.0/{post} bằng mã Page; thành công khi success === true
+  const t = await maPageCua(pageId)
+  if (!t) return { ok: false, message: CHU_KHONG_MA_PAGE }
+  const q = new URLSearchParams({ access_token: t, suppress_http_code: '1' })
+  let a
+  try { a = JSON.parse(await (await fetch(`https://graph.facebook.com/v24.0/${postId}?${q}`, { method: 'DELETE', credentials: 'include' })).text()) } catch (e) { return { ok: false, message: String(e?.message || e) } }
+  return a?.success === true && !a?.error ? { ok: true } : { ok: false, message: a?.error?.message || '' }
+}
+// Giới hạn trang (36763): đọc / ghi /{page}/settings bằng mã Page; ghi xong đọc lại để xác nhận.
+const TUOI_FB = { public: 'Public', 17: 'People 17 and over', 18: 'People 18 and over', 19: 'People 19 and over', 21: 'People 21 and over', 24: 'People 24 and over', alcohol: 'Alcohol-Related' }
+const thuong = (v) => String(v ?? '').trim().toLowerCase()
+const ngan = (v) => (v === undefined ? '-' : typeof v === 'string' ? v : JSON.stringify(v).slice(0, 200)) // b()
+const loiGraphPage = (e) => ({ message: e.message || e.error_user_msg || e.error_user_title || JSON.stringify(e) }) // p()
+async function caiDatPage(pageId, t, method, option) { // g()
+  const q = new URLSearchParams({ access_token: t, format: 'json', suppress_http_code: '1', locale: 'en_US' })
+  const i = JSON.parse(await (await fetch(`https://graph.facebook.com/v24.0/${pageId}/settings?${q}`, { method, credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    ...(option ? { body: new URLSearchParams({ option: JSON.stringify(option) }).toString() } : {}) })).text())
+  return typeof i === 'object' && i !== null ? i : {}
+}
+async function docMotCaiDat(pageId, t, key) { // h()
+  const a = await caiDatPage(pageId, t, 'GET')
+  if (a.error) return { ok: false, message: loiGraphPage(a.error) }
+  if (!Array.isArray(a.data)) return { ok: false, message: { message: JSON.stringify(a) } }
+  const r = a.data.find((e) => e.setting === key)
+  return { ok: true, found: r !== undefined, value: r?.value }
+}
+async function ghiCaiDat(pageId, t, key, value, khop) { // w()
+  const i = await caiDatPage(pageId, t, 'POST', { [key]: value })
+  if (i.success === true && !i.error) return { kind: 'accepted' }
+  const s0 = i.error ? loiGraphPage(i.error) : i.success === false ? { message: JSON.stringify(i) } : undefined
+  if (s0 && i.error?.code === 100 && i.success !== true) return { kind: 'rejected', refusal: s0 }
+  let o = await docMotCaiDat(pageId, t, key)
+  if (s0 && o.ok && !khop(o)) { await ngu(1500); const a = await docMotCaiDat(pageId, t, key); if (a.ok) o = a }
+  return o.ok ? { kind: 'read', found: o.found, value: o.value, ...(s0 ? { refusal: s0 } : {}) } : { kind: 'unreadable', message: s0 ?? o.message }
+}
+const quocGiaDoc = (co, v) => { // k()
+  if (!co) return 'unreadable'
+  let n = v
+  if (typeof n === 'string') { try { n = JSON.parse(n) } catch { return 'unreadable' } }
+  if (typeof n !== 'object' || n === null || Array.isArray(n)) return 'unreadable'
+  return typeof n.restriction_type === 'string' && Array.isArray(n.countries) ? { type: thuong(n.restriction_type), countries: n.countries.map((e) => String(e).toUpperCase()) } : 'unreadable'
+}
+const chuaRo = (e) => ({ ok: false, unverified: true, ...e }) // y()
+async function ghiTuoi(pageId, t, age) { // v()
+  const a = TUOI_FB[age]
+  const r = await ghiCaiDat(pageId, t, 'AGE_RESTRICTIONS', a, (e) => e.found && thuong(e.value) === thuong(a))
+  if (r.kind === 'unreadable') return chuaRo(r.message)
+  if (r.kind === 'rejected') return { ok: false, ...r.refusal }
+  if (r.kind === 'accepted' || (r.found && thuong(r.value) === thuong(a))) {
+    return { ok: true, message: age === 'public' ? 'đã đặt Page công khai (mọi lứa tuổi)' : age === 'alcohol' ? 'đã đặt giới hạn tuổi: liên quan đến đồ uống có cồn' : `đã đặt giới hạn tuổi: từ ${age} tuổi trở lên` }
+  }
+  return r.refusal ? { ok: false, ...r.refusal } : chuaRo({ message: `Facebook không xác nhận giới hạn tuổi — mong đợi "${a}", đọc lại được "${ngan(r.value)}"` })
+}
+async function ghiQuocGia(pageId, t, c) { // I()
+  const khop = (co, v) => { const i = quocGiaDoc(co, v); return i !== 'unreadable' && i.type === c.mode && i.countries.length === c.countries.length && [...i.countries].sort().join() === [...c.countries].sort().join() }
+  const i = await ghiCaiDat(pageId, t, 'COUNTRY_RESTRICTIONS', { restriction_type: c.mode, countries: c.countries }, (e) => khop(e.found, e.value))
+  if (i.kind === 'unreadable') return chuaRo(i.message)
+  if (i.kind === 'rejected') return { ok: false, ...i.refusal }
+  if (i.kind === 'accepted' || khop(i.found, i.value)) return { ok: true, message: `${c.mode === 'whitelist' ? 'đã đặt chỉ hiện ở' : 'đã đặt ẩn ở'}: ${c.countries.join(', ')}` }
+  if (i.refusal) return { ok: false, ...i.refusal }
+  const o = quocGiaDoc(i.found, i.value)
+  const u = o === 'unreadable' ? ngan(i.value) : o.countries.length > 0 ? `${o.type}: ${o.countries.join(',')}` : 'none'
+  return chuaRo({ message: `Facebook không xác nhận giới hạn quốc gia — mong đợi "${c.mode}: ${c.countries.join(',')}", đọc lại được "${u}"` })
+}
+const TUOI_NGUOC = new Map(Object.entries(TUOI_FB).map(([k, v]) => [thuong(v), k]))
+async function pageGioiHanDoc({ pageId }) { // E(): ảnh chụp giới hạn đang đặt (tự điền form)
+  try {
+    const t = await maPageCua(pageId)
+    if (!t) return { ok: false, message: CHU_KHONG_MA_PAGE }
+    const n = await caiDatPage(pageId, t, 'GET')
+    if (n.error) return { ok: false, ...loiGraphPage(n.error) }
+    if (!Array.isArray(n.data)) return { ok: false, message: JSON.stringify(n) }
+    const a = {}
+    const r = n.data.find((e) => e.setting === 'AGE_RESTRICTIONS')
+    if (r) { const e = TUOI_NGUOC.get(thuong(r.value)); if (e) a.age = e; else a.ageOther = ngan(r.value) }
+    const i = n.data.find((e) => e.setting === 'COUNTRY_RESTRICTIONS')
+    if (i) {
+      const e = quocGiaDoc(true, i.value)
+      if (e === 'unreadable') a.countryOther = ngan(i.value)
+      else if (e.countries.length > 0) { if (e.type === 'whitelist' || e.type === 'blacklist') a.country = { mode: e.type, countries: e.countries }; else a.countryOther = ngan(i.value) }
+    }
+    return { ok: true, snapshot: a }
+  } catch (e) { return { ok: false, message: String(e?.message || e) } }
+}
+async function pageGioiHanGhi({ pageId, part, change }) { // một phần của T(): "age" hoặc "country"
+  try {
+    const t = await maPageCua(pageId)
+    if (!t) return { ok: false, message: CHU_KHONG_MA_PAGE }
+    return part === 'age' ? await ghiTuoi(pageId, t, change.age) : await ghiQuocGia(pageId, t, change.country)
+  } catch (e) { return chuaRo({ message: String(e?.message || e) }) }
+}
+// Đổi thông tin Page (1128:17359-17503): GraphQL business.facebook.com, relayFields "minimal", tên truy vấn trên URL, __comet_req 11, av = Page.
+async function gqlThongTinPage(pageId, userId, ten, docId, variables) { // X() + et()
+  const chay = async (token) => {
+    if (!token.fb_dtsg) return { error: true, message: 'Token policy không trả session GraphQL' }
+    const body = new URLSearchParams({ __a: '1', fb_api_req_friendly_name: ten, doc_id: docId, variables: JSON.stringify(variables), server_timestamps: 'true', fb_dtsg: token.fb_dtsg,
+      __comet_req: '11', fb_api_caller_class: 'RelayModern', av: pageId, __aaid: '0', __user: userId })
+    const res = await fetch(`https://business.facebook.com/api/graphql/?${new URLSearchParams({ fb_api_req_friendly_name: ten })}`, { method: 'POST', credentials: 'include',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-fb-friendly-name': ten }, body: body.toString() })
+    return docGraphql(await res.text())
+  }
+  const r = await chay(await getAdsToken())
+  return loiPhien(r) ? chay(await getAdsToken(true)) : r
+}
+const xongThongTin = (r, chu) => (r.error ? { ok: false, message: r.message } : r.data ? { ok: true, message: chu } : { ok: false, message: 'không có data trả về' }) // et()
+async function pageThongTin({ pageId, part, value }) {
+  const { user_id } = await getAdsToken()
+  if (!user_id) return { ok: false, message: 'chưa đăng nhập Facebook' }
+  const v = String(value ?? '').trim()
+  if (part === 'bio') return xongThongTin(await gqlThongTinPage(pageId, user_id, 'BizKitPageBioSaveMutation', '29599605316352274', { bio: v }), 'đã đổi bio')
+  if (part === 'category') return xongThongTin(await gqlThongTinPage(pageId, user_id, 'BizKitPageCategorySaveMutation', '9790953384320789', { category_id: v }), 'đã đổi hạng mục')
+  if (part === 'phone') return xongThongTin(await gqlThongTinPage(pageId, user_id, 'BizKitPagePhoneNumberSaveMutation', '24209866505281348', { input: { phone_number: `tel:${v}`, actor_id: pageId, client_mutation_id: '4' } }), 'đã đổi SĐT')
+  if (part === 'email') return xongThongTin(await gqlThongTinPage(pageId, user_id, 'BizKitPageEmailSaveMutation', '27300563902911017', { input: { email_address: v, actor_id: pageId, client_mutation_id: '5' }, localScopes: [{ id: pageId, type: 'PAGE' }], scale: 1 }), 'đã đổi email')
+  if (part === 'address') {
+    const [street = '', city = '', zip = '', hood = ''] = v.split('|').map((x) => x.trim())
+    if (!city) return { ok: false, message: 'thiếu tên thành phố (cú pháp: street | city | zip | neighborhood)' }
+    const l = await gqlThongTinPage(pageId, user_id, 'BizKitPageCityDataSourceQuery', '9777957898954079', { params: { query: city, search_type: 'CITY_TYPEAHEAD', page_category: ['CITY', 'SUBCITY'], provider: 'HERE_THRIFT',
+      integration_strategy: 'STRING_MATCH', caller: 'PROFILE_ABOUT', country_filter: null, geocode_fallback: false, radius: null, result_ordering: 'INTERLEAVE' }, max_results: 5, photo_width: 50, photo_height: 50 })
+    const cityId = l.error ? null : JSON.stringify(l).match(/"id":"(\d{6,})"/)?.[1]
+    if (!cityId) return { ok: false, message: `không tìm được city_id cho "${city}"` }
+    return xongThongTin(await gqlThongTinPage(pageId, user_id, 'BizKitPageAddressSaveMutation', '27454577787499022', { input: { address_id: null, city_id: cityId, neighborhood: hood || null, street_address: street, zip,
+      actor_id: pageId, client_mutation_id: '6' }, local_scopes: [{ id: pageId, type: 'PAGE' }], scale: 1 }), 'đã đổi địa chỉ')
+  }
+  return { ok: false, message: `Không có phần ${part}` }
+}
+async function pageHangMuc() { // s() 3732:12497-12517: /fb_page_categories?locale=vi_VN, cây ⇒ danh sách phẳng theo chiều sâu
+  const r = await jbGoi('/fb_page_categories', { params: { locale: 'vi_VN' } })
+  if (r.error) return { ok: false, message: r.message }
+  const out = []
+  const di = (ds) => { for (const l of ds) { if (l.id && l.name) out.push({ value: l.id, label: l.name }); if (l.fb_page_categories?.length) di(l.fb_page_categories) } }
+  di(r.data)
+  return { ok: true, options: out }
+}
+// Page bị vô hiệu hoá / chờ xoá của chính tài khoản (3732 i(): GraphQL legacy graph.facebook.com/graphql, mã token_graphql rồi token_g).
+async function maLegacy() { // 1927:2191-2201: bootloader ReactComposerStatusEagerAttachment ⇒ EAAHULp…
+  const t = await (await fetch('https://www.facebook.com/ajax/bootloader-endpoint/?modules=ReactComposerStatusEagerAttachment.react&__a=1', { credentials: 'include' })).text()
+  const n = t.match(/"accessToken"\s*:\s*"(EAAHULp[^"]+)"/)?.[1] || t.match(/"access_token"\s*:\s*"(EAAHULp[^"]+)"/)?.[1] || t.match(/"access_token"\s*:\s*"([^"]+)"/)?.[1] || t.match(/access_token[\\"']*\s*[:=]\s*[\\"']([^\\"']+)/)?.[1]
+  if (!n) throw new Error('Không lấy được token GraphQL legacy. Endpoint Facebook có thể đã đổi.')
+  return n
+}
+async function maBm() { // 1927:1608-1632: bizKitSettingsConfig.apiAccessToken
+  const e = await gqlBm({ doc_id: '6805088329501573', variables: JSON.stringify({ businessID: '1347771445924940', overridePrimaryBusinessLocationEligibility: false }) })
+  const t = e.error ? null : e?.data?.business?.bizKitSettingsConfig?.apiAccessToken
+  if (!t) throw new Error(e.error && e.code === 1675004 ? 'Facebook đang tạm giới hạn tài khoản này vì gửi quá nhiều yêu cầu. Vui lòng đợi ít phút rồi thử lại.' : 'Không lấy được token Business Manager. Hãy đăng nhập Facebook trên trình duyệt rồi thử lại.')
+  return t
+}
+async function gqlLegacy(form, layMa) {
+  try {
+    const tok = await layMa()
+    const body = new URLSearchParams({ locale: 'en_US', __a: '1', ...form, access_token: tok }).toString()
+    const res = await fetch('https://graph.facebook.com/graphql', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-asbd-id': '1' }, body })
+    return docGraphql(await res.text())
+  } catch (e) { return { error: true, message: String(e?.message || e) } }
+}
+async function pageTatCuaToi() {
+  const f = { doc_id: '9878455382192938', variables: JSON.stringify({}), server_timestamps: 'true' }
+  let t = await gqlLegacy(f, maLegacy)
+  if (t.error) t = await gqlLegacy(f, maBm)
+  if (t.error) return { ok: false, profiles: [], message: t.message }
+  const a = t.data?.viewer?.deactivated_profiles
+  const ds = (x, st) => (x ?? []).filter((l) => l?.profile?.id).map((l) => ({ id: l.profile.id, name: l.profile.name || l.profile.id, state: st, ...(typeof l.ttl === 'number' ? { ttl: l.ttl } : {}) })) // r()
+  return { ok: true, profiles: [...ds(a?.deactivated, 'deactivated'), ...ds(a?.deleted, 'deleted')] }
+}
+async function phienFb() { // 7381.JU: tài khoản Facebook đang đăng nhập trên máy này
+  try { const t = await getAdsToken(); return { ok: true, userId: t.user_id || null } } catch { return { ok: true, userId: null } }
+}
+
 // VIA của trình duyệt này (500:343-363 v()): Graph /me id,name,picture.width(100){url} bằng mã đọc — tab VIA (≥ 3.12.33).
 async function viaMe() {
   const e = await jbGoi('/me', { params: { fields: 'id,name,picture.width(100){url}' } })
@@ -1854,7 +2099,9 @@ const CONG_CU = { 'check-hold': checkHold, 'check-location-verification': checkL
   'bm-tao': bmBoc(bmTao), 'bm-roi': bmBoc(bmRoi), 'bm-xoa': bmBoc(bmXoa), 'bm-nguoi-dung': bmNguoiDung, 'bm-tao-tkqc': bmBoc(bmTaoTkqc), 'bm-tao-page': bmBoc(bmTaoPage),
   'bm-them-mien': bmBoc(bmThemMien), 'bm-giao-dien-cu': bmBoc(bmGiaoDienCu), 'bm-doi-ten': bmBoc(bmDoiTen), 'bm-phap-ly': bmBoc(bmPhapLy), 'bm-waba-tos': bmBoc(bmWabaTos),
   'bm-waba-tao': bmBoc(bmWabaTao), 'bm-billing-ds': bmBoc(bmBillingDs), 'bm-billing-sua': bmBoc(bmBillingSua), 'bm-waba-ds': bmBoc(bmWabaDs), 'bm-waba-xoa': bmBoc(bmWabaXoa),
-  'bm-page-ds': bmBoc(bmPageDs), 'page-kich-hoat': bmBoc(pageKichHoat) }
+  'bm-page-ds': bmBoc(bmPageDs), 'page-kich-hoat': bmBoc(pageKichHoat),
+  'page-me-tkqc': bmBoc(pageMeTkqc), 'page-tao': bmBoc(pageTao), 'page-bai-ds': bmBoc(pageBaiDs), 'page-bai-xoa': bmBoc(pageBaiXoa), 'page-gioi-han-doc': pageGioiHanDoc,
+  'page-gioi-han-ghi': pageGioiHanGhi, 'page-thong-tin': bmBoc(pageThongTin), 'page-hang-muc': bmBoc(pageHangMuc), 'page-tat-cua-toi': bmBoc(pageTatCuaToi), 'phien-fb': phienFb }
 async function runTool(fn, payload) {
   const f = CONG_CU[fn]
   if (!f) return { ok: false, message: `Tiện ích chưa có chức năng ${fn} — cập nhật VAESA Extension` }
