@@ -2024,22 +2024,27 @@ async function uploadAnhNhuPage({ npeId, url, fileType, fileBase64, data = {} })
   return { ok: false, status: res.status, code: 'no-fbid', message: j?.error?.message || j?.errorSummary || 'Facebook did not return an uploaded photo ID' }
 }
 
-// Bật/Tắt nhận tin nhắn (1128:17662-17695 ep): GraphQL www useCometUSFToggleMutation av=Page (như page-thong-tin, không cần đổi phiên).
+// ĐÓNG VAI qua GraphQL www: gửi với av/__user = USER (người đang đăng nhập, fb_dtsg từ adsmanager), Page nằm ở actor_id/profile_id trong variables.
+// VÌ SAO: SMIT dùng av=profileId + actAsProfile ⇒ tiện ích SMIT Connect ĐỔI PHIÊN sang hồ sơ NPE (fetch-as-actor — bản mã KHÔNG đọc được). VAESA
+// không đổi phiên nên av=profileId ⇒ fb_dtsg vẫn của USER ⇒ Facebook báo "Hãy thử làm mới trang...". Mẫu CHẠY ĐƯỢC: pageKichHoat (ReactivateProfile
+// Mutation) thao tác hồ sơ NPE với __user=user_id (chính mình), profile ở variables. Dùng lại mẫu đó cho các mutation hồ sơ NPE dưới đây.
+const relayNguoiDung = () => (t) => ({ __comet_req: '1', fb_api_caller_class: 'RelayModern', jazoest: jazoest(t.fb_dtsg || ''), av: t.user_id || '', __user: t.user_id || '' })
 async function pageBatTatNhanTin({ profileId, on }) {
   if (!/^\d+$/.test(String(profileId ?? ''))) return { ok: false, message: 'thiếu profile id của Page (NPE)' }
   const r = await goiGraphql('www', { fb_api_req_friendly_name: 'useCometUSFToggleMutation', doc_id: '25466688156365768',
     variables: JSON.stringify({ input: { actor_id: profileId, client_mutation_id: '1', entry_point: 'privacy_checkup', group_id: null, node_id: 'PAGE_MESSAGING', settings_tree: 'FACEBOOK_SETTINGS', value: !!on } }) },
-    { them: relayBm({ av: profileId, __user: profileId }) })
+    { them: relayNguoiDung() })
   if (r.error) return { ok: false, message: r.message }
   return r.data?.xfb_usf_update_toggle?.value !== (on ? '1' : '0')
     ? { ok: false, message: 'Facebook không xác nhận thay đổi — giá trị trả về không khớp trạng thái yêu cầu' }
     : { ok: true, message: on ? 'đã bật nhắn tin' : 'đã tắt nhắn tin' }
 }
-// Đổi trạng thái Page (97056 s / kich-hoat-huy-dang): GraphQL www useRepublishMutation / useUnpublishMutation av=Page.
+// Đổi trạng thái Page (97056 s / kich-hoat-huy-dang): GraphQL www useRepublishMutation / useUnpublishMutation, đóng vai USER + profile_id ở variables
+// (giống hệt pageKichHoat ReactivateProfileMutation đang chạy — cùng là mutation trạng thái hồ sơ NPE).
 async function pageDoiTrangThai({ profileId, publish }) {
   if (!/^\d+$/.test(String(profileId ?? ''))) return { ok: false, message: 'thiếu profile id của Page (NPE)' }
   const r = await goiGraphql('www', { fb_api_req_friendly_name: publish ? 'useRepublishMutation' : 'useUnpublishMutation', doc_id: publish ? '9665602063553888' : '9678811222195266',
-    variables: JSON.stringify({ profile_id: profileId }) }, { them: relayBm({ av: profileId, __user: profileId }) })
+    variables: JSON.stringify({ profile_id: profileId }) }, { them: relayNguoiDung() })
   if (r.error) return { ok: false, message: r.message }
   const v = publish ? r.data?.xfb_republish_profile : r.data?.xfb_unpublish_profile
   return v !== (publish ? 'PUBLISHED' : 'DRAFT') ? { ok: false, message: 'Facebook chưa xác nhận đổi trạng thái Page' } : { ok: true, message: publish ? 'đã kích hoạt Page' : 'đã huỷ đăng Page' }
@@ -2048,7 +2053,7 @@ async function pageDoiTrangThai({ profileId, publish }) {
 async function pageGoQuocGia({ profileId }) {
   if (!/^\d+$/.test(String(profileId ?? ''))) return { ok: false, message: 'thiếu profile id của Page (NPE)' }
   const r = await goiGraphql('www', { fb_api_req_friendly_name: 'CountryRestrictionSettingMutation', doc_id: '9629790297112029',
-    variables: JSON.stringify({ input: { country_list: [], is_blocklist: true, actor_id: profileId, client_mutation_id: '1' } }) }, { them: relayBm({ av: profileId, __user: profileId }) })
+    variables: JSON.stringify({ input: { country_list: [], is_blocklist: true, actor_id: profileId, client_mutation_id: '1' } }) }, { them: relayNguoiDung() })
   if (r.error) return { ok: false, message: r.message }
   return r.data?.country_restriction_mutation?.success === true ? { ok: true, message: 'đã gỡ giới hạn quốc gia' } : { ok: false, unverified: true, message: JSON.stringify(r).slice(0, 300) }
 }
@@ -2060,14 +2065,14 @@ async function pageDatAnh({ profileId, loai, fbid }) {
     const r = await goiGraphql('www', { fb_api_req_friendly_name: 'ProfileCometProfilePictureSetMutation', doc_id: '26996880216606251', server_timestamps: 'true',
       variables: JSON.stringify({ input: { attribution_id_v2: '', caption: '', existing_photo_id: String(fbid), expiration_time: null, profile_id: profileId, profile_pic_method: 'EXISTING', profile_pic_source: 'TIMELINE',
         scaled_crop_rect: { height: 0.99536, width: 1, x: 0, y: 0.00232 }, skip_cropping: true, actor_id: profileId, client_mutation_id: '1' }, isPage: false, isProfile: true, scale: 1,
-        __relay_internal__pv__ProfileGeminiIsCoinFlipEnabledrelayprovider: false }) }, { them: relayBm({ av: profileId, __user: profileId }) })
+        __relay_internal__pv__ProfileGeminiIsCoinFlipEnabledrelayprovider: false }) }, { them: relayNguoiDung() })
     if (r.error) return { ok: false, message: `Đặt avatar thất bại: ${r.message}` }
     if (r.data?.profile_picture_set?.profile?.id !== profileId) return { ok: false, message: 'Facebook chưa xác nhận avatar mới' }
     return { ok: true, message: 'Đã đổi avatar', imageUrl: r.data?.profile_picture_set?.profile?.profilePicLarge?.uri || '' }
   }
   const r = await goiGraphql('www', { fb_api_req_friendly_name: 'ProfileCometCoverPhotoUpdateMutation', doc_id: '26648951184714383', server_timestamps: 'true',
     variables: JSON.stringify({ input: { attribution_id_v2: '', cover_photo_id: String(fbid), focus: { x: 0.5, y: 0.5 }, target_user_id: profileId, actor_id: profileId, client_mutation_id: '1' }, scale: 1, contextualProfileContext: null }) },
-    { them: relayBm({ av: profileId, __user: profileId }) })
+    { them: relayNguoiDung() })
   if (r.error) return { ok: false, message: `Đặt ảnh bìa thất bại: ${r.message}` }
   if (r.data?.user_update_cover_photo?.user?.cover_photo?.photo?.id !== String(fbid)) return { ok: false, message: 'Facebook chưa xác nhận ảnh bìa mới' }
   return { ok: true, message: 'Đã đổi ảnh bìa' }
