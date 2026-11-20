@@ -646,11 +646,42 @@ function docGraphql(t, { partial = [], ghep = false } = {}) {
 }
 const loiPhien = (r) => r?.error && ([190, 102, 463, 467, 1357004].includes(r.code) || /fb_dtsg|access token|session|login|log in|logged in|đăng nhập/i.test(r.message || ''))
 // UG: www báo 1675002 ⇒ gọi lại qua business; lỗi giống hết phiên ⇒ lấy phiên mới, thử lại 1 lần.
+// ── Đóng vai hồ sơ Page (NPE) — port SMIT Connect createActorRule + handleDeclarativeRuleManager (background.js 62-242 bản deobf) ──
+// Gắn cookie "; i_user=<profileId>" vào ĐÚNG request đó bằng 1 luật DNR session (khớp qua tham số tag __vaesa_actor), rồi gỡ ngay sau khi fetch.
+// Facebook coi request là hồ sơ Page thao tác (c_user vẫn là người đang đăng nhập — FB tự kiểm người này có quản trị Page không, nên chỉ chạy
+// được trên Page mình có quyền). ĐÂY CHÍNH LÀ cơ chế "đổi phiên / fetch-as-actor" mà trước ghi là "bản mã KHÔNG đọc được": nay anh Trung đưa
+// mã nguồn SMIT Connect 1.2.3 (Downloads\smit-connect-1.2.3-deobf\background.js) nên đọc được và chép y hệt.
+let _dongVaiSo = 0
+async function dongVaiPageFetch(profileId, baseUrl, doFetch) {
+  if (!/^\d+$/.test(String(profileId ?? ''))) return { error: true, message: 'profile id (NPE) không hợp lệ' }
+  const ruleId = 941000000 + (_dongVaiSo++ % 100)
+  const tag = 'va' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+  const u = new URL(baseUrl); u.searchParams.set('__vaesa_actor', tag) // tag để DNR khớp đúng request này, không đụng request khác
+  try {
+    await chrome.declarativeNetRequest.updateSessionRules({
+      removeRuleIds: [ruleId],
+      addRules: [{ id: ruleId, priority: 100,
+        action: { type: 'modifyHeaders', requestHeaders: [{ header: 'cookie', operation: 'append', value: '; i_user=' + String(profileId) }] },
+        condition: { initiatorDomains: [chrome.runtime.id], urlFilter: '__vaesa_actor=' + tag, resourceTypes: ['xmlhttprequest'] } }],
+    })
+  } catch (e) { return { error: true, message: 'không đặt được luật đóng vai Page: ' + (e?.message || e) } }
+  try { return { res: await doFetch(u.toString()) } }
+  finally { chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: [ruleId] }).catch(() => {}) }
+}
 async function goiGraphql(host, form, opt = {}) {
   const chay = async (token) => {
     const goi = async (h) => {
       const body = new URLSearchParams({ locale: 'en_US', __a: '1', ...form, fb_dtsg: token.fb_dtsg || '', lsd: token.lsd || '', ...(typeof opt.them === 'function' ? opt.them(token) : opt.them || {}) })
-      const res = await fetch(`https://${h}.facebook.com/api/graphql/`, { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-asbd-id': '1' }, body: body.toString() })
+      const url = `https://${h}.facebook.com/api/graphql/`
+      const doFetch = (uu) => fetch(uu, { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-asbd-id': '1' }, body: body.toString() })
+      let res
+      if (opt.dongVaiPage) {
+        const w = await dongVaiPageFetch(opt.dongVaiPage, url, doFetch)
+        if (w.error) return w
+        res = w.res
+      } else {
+        res = await doFetch(url)
+      }
       return docGraphql(await res.text(), opt)
     }
     let r = await goi(host)
@@ -1980,12 +2011,11 @@ async function pageHangMuc() { // s() 3732:12497-12517: /fb_page_categories?loca
 }
 
 // ── "Danh tính Page" (SMIT Connect fetch-as-actor / upload-image — các công cụ Đổi tên, Đổi ảnh, Bật/Tắt nhắn tin, Đổi trạng thái Page) ──
-// LƯU Ý QUAN TRỌNG (đọc mã): bản tiện ích SMIT Connect trong máy KHÔNG có mã xử lý fetch-as-actor / upload-image (docs/modules/smit/
-// cong-cu-page.md §5: "NOT FOUND" — không rõ SMIT đổi phiên sang hồ sơ Page bằng cookie/header gì, cũng như tên trường multipart tải ảnh).
-// Vì CẤM bịa, hai lệnh dưới chỉ gọi fetch kèm cookie phiên hiện tại (credentials:'include'); danh tính Page do tham số av/__user trong THÂN
-// yêu cầu GraphQL quyết định (đã chứng minh qua page-thong-tin av=Page). Với endpoint web không-GraphQL (name.php), danh tính là hồ sơ đang
-// hoạt động của phiên — KHÔNG tự đổi cookie sang NPE. Trang web tự kiểm "acting id === profileId" (như SMIT) nên nếu phiên không ở đúng Page
-// thì báo lỗi, KHÔNG đổi nhầm. Chỉ cho gọi facebook.com (như open-tab / as-csv).
+// CẬP NHẬT 20/11: anh Trung đưa mã nguồn SMIT Connect 1.2.3 (Downloads\smit-connect-1.2.3-deobf\background.js — bản GỠ RỐI, đọc được hết). Cơ
+// chế "đổi phiên sang hồ sơ Page" = gắn cookie i_user=<profileId> vào ĐÚNG request đó bằng declarativeNetRequest (createActorRule, bg 62-84),
+// rồi fetch TỪ service worker. Đã port sang dongVaiPageFetch() ở trên và dùng cho name.php (đổi tên), upload ảnh, USF toggle, country, ảnh.
+// Danh tính: cookie i_user=profileId + av/__user=profileId trong thân; fb_dtsg vẫn của USER. FB tự kiểm quyền quản trị nên chỉ chạy trên Page
+// mình có quyền, không đổi nhầm. Chỉ cho gọi facebook.com.
 async function fetchNhuPage({ npeId, url, options = {} }) { // ey (1927:2583-2671): { npeId, url, options } ⇒ body
   let u
   try { u = new URL(String(url)) } catch { return { ok: false, message: 'Đường dẫn không hợp lệ' } }
@@ -1993,7 +2023,13 @@ async function fetchNhuPage({ npeId, url, options = {} }) { // ey (1927:2583-267
   const o = { credentials: 'include', ...options }
   if (o.method && String(o.method).toUpperCase() === 'GET') delete o.body
   let res
-  try { res = await fetch(u.toString(), o) } catch (e) { return { ok: false, message: `Lỗi kết nối mạng: ${e?.message || e}` } }
+  try {
+    if (npeId != null && String(npeId) !== '') { // name.php & endpoint web không-GraphQL: đóng vai Page qua cookie i_user (SMIT createActorRule)
+      const w = await dongVaiPageFetch(npeId, u.toString(), (uu) => fetch(uu, o))
+      if (w.error) return { ok: false, message: w.message }
+      res = w.res
+    } else { res = await fetch(u.toString(), o) }
+  } catch (e) { return { ok: false, message: `Lỗi kết nối mạng: ${e?.message || e}` } }
   let body
   try { body = await res.text() } catch (e) { return { ok: false, message: `Không đọc được phản hồi: ${e?.message || e}` } }
   return { ok: true, body, status: res.status, finalUrl: res.url, npeId: npeId ?? null }
@@ -2015,7 +2051,14 @@ async function uploadAnhNhuPage({ npeId, url, fileType, fileBase64, data = {} })
   fd.append('__a', '1')
   fd.append('source', new Blob([bin], { type: fileType || 'image/jpeg' }), fileType === 'image/png' ? 'photo.png' : 'photo.jpg')
   let res
-  try { res = await fetch(u.toString(), { method: 'POST', credentials: 'include', body: fd }) } catch (e) { return { ok: false, code: 'network', message: `Lỗi tải ảnh: ${e?.message || e}` } }
+  try {
+    const doPost = (uu) => fetch(uu, { method: 'POST', credentials: 'include', body: fd })
+    if (npeId != null && String(npeId) !== '') { // tải ảnh dưới danh tính Page: cookie i_user=npeId (SMIT handleBlobUpload dùng cùng luật actor)
+      const w = await dongVaiPageFetch(npeId, u.toString(), doPost)
+      if (w.error) return { ok: false, code: 'actor', message: w.message }
+      res = w.res
+    } else { res = await doPost(u.toString()) }
+  } catch (e) { return { ok: false, code: 'network', message: `Lỗi tải ảnh: ${e?.message || e}` } }
   const raw = await res.text()
   let j
   try { j = JSON.parse(raw.startsWith('for (;;);') ? raw.slice(9) : raw) } catch { j = null }
@@ -2024,24 +2067,23 @@ async function uploadAnhNhuPage({ npeId, url, fileType, fileBase64, data = {} })
   return { ok: false, status: res.status, code: 'no-fbid', message: j?.error?.message || j?.errorSummary || 'Facebook did not return an uploaded photo ID' }
 }
 
-// ĐÓNG VAI qua GraphQL www: gửi với av/__user = USER (người đang đăng nhập, fb_dtsg từ adsmanager), Page nằm ở actor_id/profile_id trong variables.
-// VÌ SAO: SMIT dùng av=profileId + actAsProfile ⇒ tiện ích SMIT Connect ĐỔI PHIÊN sang hồ sơ NPE (fetch-as-actor — bản mã KHÔNG đọc được). VAESA
-// không đổi phiên nên av=profileId ⇒ fb_dtsg vẫn của USER ⇒ Facebook báo "Hãy thử làm mới trang...". Mẫu CHẠY ĐƯỢC: pageKichHoat (ReactivateProfile
-// Mutation) thao tác hồ sơ NPE với __user=user_id (chính mình), profile ở variables. Dùng lại mẫu đó cho các mutation hồ sơ NPE dưới đây.
+// HAI KIỂU ĐÓNG VAI cho mutation hồ sơ NPE:
+//  (1) relayNguoiDung — av/__user = USER, Page ở actor_id/profile_id trong variables. Dùng cho mutation FB cho phép USER (chủ Page) tự thao tác:
+//      pageKichHoat / pageDoiTrangThai (ReactivateProfile / Republish) — CHẠY ĐƯỢC không cần đổi phiên.
+//  (2) relayDongVaiPage + opt.dongVaiPage — av/__user = profileId KÈM cookie i_user=profileId (port SMIT createActorRule). Dùng cho mutation BUỘC
+//      actor = Page: USF toggle (bật/tắt nhắn tin), CountryRestriction, ProfileComet ảnh. Trước thiếu cookie i_user nên FB báo field_exception.
 const relayNguoiDung = () => (t) => ({ __comet_req: '1', fb_api_caller_class: 'RelayModern', jazoest: jazoest(t.fb_dtsg || ''), av: t.user_id || '', __user: t.user_id || '' })
+// Đóng vai Page: av/__user = profileId (hồ sơ NPE), fb_dtsg vẫn của USER — đi kèm cookie i_user=profileId (opt.dongVaiPage) thì FB chấp nhận.
+const relayDongVaiPage = (profileId) => (t) => ({ __comet_req: '1', fb_api_caller_class: 'RelayModern', jazoest: jazoest(t.fb_dtsg || ''), av: String(profileId), __user: String(profileId) })
 // CHẨN ĐOÁN (20/11): doc_id + variables khớp HỆT SMIT, nhưng đóng vai USER trả "Lỗi thực hiện truy vấn." (khác republish chạy được). USF toggle
 // (settings_tree) có thể BẮT BUỘC đóng vai đúng hồ sơ (av=profileId + đổi phiên). Fetch thẳng để bắt status + body + mã lỗi FB mà đo.
 async function pageBatTatNhanTin({ profileId, on }) {
   if (!/^\d+$/.test(String(profileId ?? ''))) return { ok: false, message: 'thiếu profile id của Page (NPE)' }
-  const token = await getAdsToken()
-  const body = new URLSearchParams({ locale: 'en_US', __a: '1', fb_api_req_friendly_name: 'useCometUSFToggleMutation', doc_id: '25466688156365768',
-    variables: JSON.stringify({ input: { actor_id: profileId, client_mutation_id: '1', entry_point: 'privacy_checkup', group_id: null, node_id: 'PAGE_MESSAGING', settings_tree: 'FACEBOOK_SETTINGS', value: !!on } }),
-    fb_dtsg: token.fb_dtsg || '', lsd: token.lsd || '', __comet_req: '1', fb_api_caller_class: 'RelayModern', jazoest: jazoest(token.fb_dtsg || ''), av: token.user_id || '', __user: token.user_id || '' })
-  let res, rawText
-  try { res = await fetch('https://www.facebook.com/api/graphql/', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-asbd-id': '1' }, body: body.toString() }); rawText = await res.text() }
-  catch (e) { return { ok: false, message: `lỗi mạng: ${e?.message || e}` } }
-  const r = docGraphql(rawText)
-  if (r.error) return { ok: false, message: r.message, ...(r.code !== undefined ? { code: r.code } : {}), rawStatus: res.status, raw: String(rawText).replace(/^for \(;;\);/, '').slice(0, 1000) }
+  // ĐÓNG VAI Page qua cookie i_user (chép từ SMIT Connect 1.2.3 deobf): USF toggle buộc actor = hồ sơ Page thì FB mới chấp nhận.
+  const r = await goiGraphql('www', { fb_api_req_friendly_name: 'useCometUSFToggleMutation', doc_id: '25466688156365768',
+    variables: JSON.stringify({ input: { actor_id: profileId, client_mutation_id: '1', entry_point: 'privacy_checkup', group_id: null, node_id: 'PAGE_MESSAGING', settings_tree: 'FACEBOOK_SETTINGS', value: !!on } }) },
+    { them: relayDongVaiPage(profileId), dongVaiPage: profileId })
+  if (r.error) return { ok: false, message: r.message, ...(r.code !== undefined ? { code: r.code } : {}), raw: JSON.stringify(r?.data ?? null).slice(0, 700) }
   return r.data?.xfb_usf_update_toggle?.value !== (on ? '1' : '0')
     ? { ok: false, message: 'Facebook không xác nhận thay đổi — giá trị trả về không khớp trạng thái yêu cầu', raw: JSON.stringify(r?.data ?? r ?? null).slice(0, 700) }
     : { ok: true, message: on ? 'đã bật nhắn tin' : 'đã tắt nhắn tin' }
@@ -2065,7 +2107,7 @@ async function pageDoiTrangThai({ profileId, publish }) {
 async function pageGoQuocGia({ profileId }) {
   if (!/^\d+$/.test(String(profileId ?? ''))) return { ok: false, message: 'thiếu profile id của Page (NPE)' }
   const r = await goiGraphql('www', { fb_api_req_friendly_name: 'CountryRestrictionSettingMutation', doc_id: '9629790297112029',
-    variables: JSON.stringify({ input: { country_list: [], is_blocklist: true, actor_id: profileId, client_mutation_id: '1' } }) }, { them: relayNguoiDung() })
+    variables: JSON.stringify({ input: { country_list: [], is_blocklist: true, actor_id: profileId, client_mutation_id: '1' } }) }, { them: relayDongVaiPage(profileId), dongVaiPage: profileId })
   if (r.error) return { ok: false, message: r.message }
   return r.data?.country_restriction_mutation?.success === true ? { ok: true, message: 'đã gỡ giới hạn quốc gia' } : { ok: false, unverified: true, message: JSON.stringify(r).slice(0, 300) }
 }
@@ -2077,14 +2119,14 @@ async function pageDatAnh({ profileId, loai, fbid }) {
     const r = await goiGraphql('www', { fb_api_req_friendly_name: 'ProfileCometProfilePictureSetMutation', doc_id: '26996880216606251', server_timestamps: 'true',
       variables: JSON.stringify({ input: { attribution_id_v2: '', caption: '', existing_photo_id: String(fbid), expiration_time: null, profile_id: profileId, profile_pic_method: 'EXISTING', profile_pic_source: 'TIMELINE',
         scaled_crop_rect: { height: 0.99536, width: 1, x: 0, y: 0.00232 }, skip_cropping: true, actor_id: profileId, client_mutation_id: '1' }, isPage: false, isProfile: true, scale: 1,
-        __relay_internal__pv__ProfileGeminiIsCoinFlipEnabledrelayprovider: false }) }, { them: relayNguoiDung() })
+        __relay_internal__pv__ProfileGeminiIsCoinFlipEnabledrelayprovider: false }) }, { them: relayDongVaiPage(profileId), dongVaiPage: profileId })
     if (r.error) return { ok: false, message: `Đặt avatar thất bại: ${r.message}` }
     if (r.data?.profile_picture_set?.profile?.id !== profileId) return { ok: false, message: 'Facebook chưa xác nhận avatar mới' }
     return { ok: true, message: 'Đã đổi avatar', imageUrl: r.data?.profile_picture_set?.profile?.profilePicLarge?.uri || '' }
   }
   const r = await goiGraphql('www', { fb_api_req_friendly_name: 'ProfileCometCoverPhotoUpdateMutation', doc_id: '26648951184714383', server_timestamps: 'true',
     variables: JSON.stringify({ input: { attribution_id_v2: '', cover_photo_id: String(fbid), focus: { x: 0.5, y: 0.5 }, target_user_id: profileId, actor_id: profileId, client_mutation_id: '1' }, scale: 1, contextualProfileContext: null }) },
-    { them: relayNguoiDung() })
+    { them: relayDongVaiPage(profileId), dongVaiPage: profileId })
   if (r.error) return { ok: false, message: `Đặt ảnh bìa thất bại: ${r.message}` }
   if (r.data?.user_update_cover_photo?.user?.cover_photo?.photo?.id !== String(fbid)) return { ok: false, message: 'Facebook chưa xác nhận ảnh bìa mới' }
   return { ok: true, message: 'Đã đổi ảnh bìa' }
