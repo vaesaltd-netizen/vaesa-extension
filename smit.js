@@ -2246,6 +2246,40 @@ async function qlqcGhi({ id, body }) {
     return { ok: false, error: { message: e instanceof Error ? e.message : String(e) } }
   }
 }
+// ── Ads Save (SMIT remote ads-save 414.5d1ff1ad.js; VAESA docs/modules/smit/ads-save.md §17.4) — mỗi lệnh = MỘT lần gọi Facebook,
+// trả nguyên phản hồi Graph trong { ok:true, data } (jbGoi: lỗi Graph ⇒ { error:true, message, code, userTitle? }). Trang Ads Save tự
+// lặp / nghỉ như SMIT (rn 414:3420, ro 3443, lv 4683) ⇒ không lệnh nào vướng giới hạn 5 phút của service worker.
+const TRUONG_TK_AS = 'account_id,id,name,account_status' // rt 414:3411
+const THAN_XUAT_AS = ['__ad_account_id', 'date_preset', 'default_summary', 'export_columns', 'export_format', 'export_name', 'fields', 'filtering', 'level'] // lg 414:4664-4675
+async function asTkqc({ next } = {}) { // R1: /me/adaccounts limit 100, trang sau = paging.next
+  if (next) {
+    if (!/^https:\/\/graph\.facebook\.com\//.test(String(next))) return { ok: false, message: 'Trang tiếp không hợp lệ' }
+    return { ok: true, data: await jbGoi(String(next)) }
+  }
+  return { ok: true, data: await jbGoi('/me/adaccounts', { params: { limit: 100, fields: TRUONG_TK_AS } }) }
+}
+async function asTkqcId({ id } = {}) { // R2: GET /act_<id>
+  const so = String(id ?? '').replace(/^act_/, '')
+  if (!/^\d+$/.test(so)) return { ok: true, data: { error: true, message: 'ID TKQC không hợp lệ' } }
+  return { ok: true, data: await jbGoi(`/act_${so}`, { params: { fields: TRUONG_TK_AS } }) }
+}
+async function asXuat({ id, body } = {}) { // R3: POST /act_<id>/insights?__cppo=1 — Facebook dựng báo cáo CSV (chỉ đọc số liệu)
+  if (!/^act_\d+$/.test(String(id))) return { ok: false, message: 'ID TKQC không hợp lệ' }
+  const than = Object.fromEntries(THAN_XUAT_AS.filter((k) => body?.[k] !== undefined).map((k) => [k, body[k]]))
+  if (than.export_format !== 'csv') return { ok: false, message: 'Chỉ xin xuất CSV' }
+  return { ok: true, data: await jbGoi(`/${id}/insights`, { method: 'POST', params: { __cppo: 1 }, body: than }) }
+}
+async function asHoi({ reportRunId, accountId } = {}) { // R4: GET /<report_run_id>?__cppo=1&__ad_account_id=…&include_headers=false
+  if (!/^\d+$/.test(String(reportRunId)) || !/^\d+$/.test(String(accountId))) return { ok: false, message: 'Mã báo cáo không hợp lệ' }
+  return { ok: true, data: await jbGoi(`/${reportRunId}`, { params: { __cppo: 1, __ad_account_id: accountId, include_headers: false } }) }
+}
+async function asCsv({ url } = {}) { // R5: tải nội dung CSV từ async_report_url (chỉ nhận đường dẫn facebook.com)
+  let u
+  try { u = new URL(String(url)) } catch { return { ok: false, message: 'Đường dẫn CSV không hợp lệ' } }
+  if (u.protocol !== 'https:' || !/(^|\.)facebook\.com$/.test(u.hostname)) return { ok: false, message: 'Chỉ tải CSV từ facebook.com' }
+  const res = await fetch(u.toString(), { credentials: 'include' })
+  return { ok: true, text: await res.text() }
+}
 const CONG_CU = { 'check-hold': checkHold, 'check-location-verification': checkLocation, 'download-invoices': openInvoices,
   'activate-prepay': activatePrepay, 'delete-card': deleteCard, 'set-default-card': setDefaultCard, 'pay-debt': payDebt, 'open-tab': openTab,
   'import-campaign-xlsx': importXlsx, 'boost-gql': boostGql, 'boost-session': boostSession, 'boost-me-pages': boostMePages,
@@ -2259,7 +2293,8 @@ const CONG_CU = { 'check-hold': checkHold, 'check-location-verification': checkL
   'bm-page-ds': bmBoc(bmPageDs), 'page-kich-hoat': bmBoc(pageKichHoat),
   'page-me-tkqc': bmBoc(pageMeTkqc), 'page-tao': bmBoc(pageTao), 'page-bai-ds': bmBoc(pageBaiDs), 'page-bai-xoa': bmBoc(pageBaiXoa), 'page-gioi-han-doc': pageGioiHanDoc,
   'page-gioi-han-ghi': pageGioiHanGhi, 'page-thong-tin': bmBoc(pageThongTin), 'page-hang-muc': bmBoc(pageHangMuc), 'page-tat-cua-toi': bmBoc(pageTatCuaToi), 'phien-fb': phienFb,
-  'qlqc-tkqc': qlqcTkqc, 'qlqc-cap': qlqcCap, 'qlqc-ghi': qlqcGhi }
+  'qlqc-tkqc': qlqcTkqc, 'qlqc-cap': qlqcCap, 'qlqc-ghi': qlqcGhi,
+  'as-tkqc': asTkqc, 'as-tkqc-id': asTkqcId, 'as-xuat': asXuat, 'as-hoi': asHoi, 'as-csv': asCsv }
 async function runTool(fn, payload) {
   const f = CONG_CU[fn]
   if (!f) return { ok: false, message: `Tiện ích chưa có chức năng ${fn} — cập nhật VAESA Extension` }
