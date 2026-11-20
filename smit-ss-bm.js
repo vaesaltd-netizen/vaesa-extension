@@ -504,6 +504,37 @@ const LENH = {
     } catch { /* fallthrough */ }
     return { ok: false, message: `Không gửi được lời mời cho ${email}` }
   },
+
+
+  // ═══ 16. remove-waba: xoá WABA khỏi BM (1128:800-836) ══════════════════════════════
+  'ss-bm-waba': async ({ bm } = {}) => {
+    const b = so(bm)
+    if (!SO.test(b)) return sai('ID BM')
+    const r = await N.jbGoi(`/${b}`, { version: 'v20.0', params: { fields: 'whatsapp_business_accounts.limit(200){id,name,verified_name,status}' } })
+    if (loiGraph(r)) return { ok: false, message: r.message || r.error?.message || 'Lỗi' }
+    return { ok: true, rows: r.whatsapp_business_accounts?.data ?? [] }
+  },
+  'ss-bm-remove-waba': async ({ bm, wabaId } = {}) => {
+    const b = so(bm), w = String(wabaId ?? '').trim()
+    if (!SO.test(b) || !w) return sai('ID')
+    const u = await uid()
+    if (!u) return { ok: false, message: 'Chưa đăng nhập Facebook', notLoggedIn: true }
+    const r = await N.goiGraphql('business', {
+      fb_api_req_friendly_name: 'useDeleteWhatsAppBusinessAccountMutation',
+      doc_id: '9902575596489138',
+      variables: JSON.stringify({ input: { actor_id: u, client_mutation_id: '1', waba_id: w } }),
+    })
+    if (loiGraph(r)) return { ok: false, message: `${w}: ${r.message || r.error?.message || 'Lỗi'}` }
+    if (!r.data?.xfb_delete_whatsapp_business_account?.success) return { ok: false, message: `${w}: Xoá không được xác nhận` }
+    return { ok: true, data: r }
+  },
+
+  // ═══ 17. owned-ads: danh sách TKQC owned của BM (dùng cho hộp tài sản, ghép với client-ads) ═══
+  'ss-bm-owned-ads': async ({ bm } = {}) => {
+    const b = so(bm)
+    if (!SO.test(b)) return sai('ID BM')
+    return { ok: true, data: await N.jbGoi(`/${b}/owned_ad_accounts`, { version: 'v14.0', params: { fields: 'id,account_id,name,account_status', limit: 500 } }) }
+  },
 }
 self.vaesaSmitThem = Object.assign(self.vaesaSmitThem || {}, LENH)
 })()
