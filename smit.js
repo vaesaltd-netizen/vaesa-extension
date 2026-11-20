@@ -2036,7 +2036,7 @@ async function pageBatTatNhanTin({ profileId, on }) {
     { them: relayNguoiDung() })
   if (r.error) return { ok: false, message: r.message }
   return r.data?.xfb_usf_update_toggle?.value !== (on ? '1' : '0')
-    ? { ok: false, message: 'Facebook không xác nhận thay đổi — giá trị trả về không khớp trạng thái yêu cầu' }
+    ? { ok: false, message: 'Facebook không xác nhận thay đổi — giá trị trả về không khớp trạng thái yêu cầu', raw: JSON.stringify(r?.data ?? r ?? null).slice(0, 700) }
     : { ok: true, message: on ? 'đã bật nhắn tin' : 'đã tắt nhắn tin' }
 }
 // Đổi trạng thái Page (97056 s / kich-hoat-huy-dang): GraphQL www useRepublishMutation / useUnpublishMutation, đóng vai USER + profile_id ở variables
@@ -2047,7 +2047,7 @@ async function pageDoiTrangThai({ profileId, publish }) {
     variables: JSON.stringify({ profile_id: profileId }) }, { them: relayNguoiDung() })
   if (r.error) return { ok: false, message: r.message }
   const v = publish ? r.data?.xfb_republish_profile : r.data?.xfb_unpublish_profile
-  return v !== (publish ? 'PUBLISHED' : 'DRAFT') ? { ok: false, message: 'Facebook chưa xác nhận đổi trạng thái Page' } : { ok: true, message: publish ? 'đã kích hoạt Page' : 'đã huỷ đăng Page' }
+  return v !== (publish ? 'PUBLISHED' : 'DRAFT') ? { ok: false, message: 'Facebook chưa xác nhận đổi trạng thái Page', raw: JSON.stringify(r?.data ?? r ?? null).slice(0, 700) } : { ok: true, message: publish ? 'đã kích hoạt Page' : 'đã huỷ đăng Page' }
 }
 // Gỡ giới hạn quốc gia của Page (36763 S): GraphQL www CountryRestrictionSettingMutation av=Page — phần duy nhất của "Đặt giới hạn trang" cần danh tính Page.
 async function pageGoQuocGia({ profileId }) {
