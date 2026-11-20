@@ -414,6 +414,52 @@ const LENH = {
     if (!ok) return { ok: false, message: 'URL không phải dạng lời mời BM Facebook hợp lệ' }
     return { ok: true, url: u, message: 'Link hợp lệ — mở trong trình duyệt để chấp nhận' }
   },
+
+  // ═══ 14. remove-bm-hidden-admin: quét system user ẩn + xoá (1128:13735 + module 83204) ═══
+  // scan: GET /{bmId}/system_users → admins có assigned_apps
+  'ss-bm-hidden-admins': async ({ bm } = {}) => {
+    const b = so(bm)
+    if (!SO.test(b)) return sai('ID BM')
+    const rows = []
+    let after
+    do {
+      const params = { fields: 'id,name,assigned_apps.limit(100){id,name}', limit: 300 }
+      if (after) params.after = after
+      const r = await N.jbGoi(`/${b}/system_users`, { params, tokenPurpose: 'businessManagerAction' })
+      if (loiGraph(r)) return { ok: false, message: r.message || r.error?.message || 'Lỗi quét system user' }
+      for (const e of (r.data || [])) {
+        const apps = (e.assigned_apps?.data || []).filter((a) => a.id).map((a) => ({ id: String(a.id), ...(a.name ? { name: a.name } : {}) }))
+        if (e.id && apps.length > 0) rows.push({ id: String(e.id), ...(e.name ? { name: e.name } : {}), apps })
+      }
+      try { after = r.paging?.next ? new URL(r.paging.next).searchParams.get('after')?.trim() || undefined : undefined } catch { after = undefined }
+    } while (after)
+    return { ok: true, admins: rows }
+  },
+  // remove: thu hồi token + xoá kết nối app (83204 d + m)
+  'ss-bm-remove-hidden-admin': async ({ bm, admin } = {}) => {
+    const b = so(bm)
+    if (!SO.test(b)) return sai('ID BM')
+    if (!admin?.id) return sai('admin')
+    const revoke = await N.goiGraphql('business', {
+      fb_api_req_friendly_name: 'BizKitSettingsSystemUserAccessTokenRevocationModalMutation',
+      doc_id: '23892262370416074',
+      variables: JSON.stringify({ input: { system_user_id: admin.id } }),
+    }).catch(() => null)
+    const revokeOk = revoke && !loiGraph(revoke) && revoke.data?.xfb_system_user_token_revocation === true
+    const remaining = []
+    for (const app of (admin.apps || [])) {
+      const rm = await N.goiGraphql('business', {
+        fb_api_req_friendly_name: 'BizKitRemoveUserAssetConnectionMutation',
+        doc_id: '39520861720834154',
+        variables: JSON.stringify({ businessID: b, userID: admin.id, assetID: app.id, assetTypes: ['APP'], isDirectAdmin: false, __relay_internal__pv__BillingHubContextFieldCutoverrelayprovider: false }),
+      }).catch(() => null)
+      const rmOk = rm && !loiGraph(rm) && !!rm.data?.business_settings_remove_user_asset_connection?.business_asset?.id
+      if (!rmOk) remaining.push(app)
+    }
+    const id = admin.name ? `${admin.name} (${admin.id})` : admin.id
+    const done = revokeOk && remaining.length === 0
+    return { ok: done, remainingApps: remaining, message: done ? `${id}: đã xoá` : !revokeOk ? `${id}: không thu hồi được token` : `${id}: còn ${remaining.length} app chưa gỡ` }
+  },
 }
 self.vaesaSmitThem = Object.assign(self.vaesaSmitThem || {}, LENH)
 })()
