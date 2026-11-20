@@ -52,6 +52,8 @@ const ACTION_MAP = {
   FB_NO_ROLE: 'VAESA_FB_NO_ROLE',
   SMIT_CACHE_GET: 'VAESA_SMIT_CACHE_GET',
   SMIT_CACHE_SET: 'VAESA_SMIT_CACHE_SET',
+  CHECK_UPDATE: 'VAESA_CHECK_UPDATE',
+  RUN_UPDATE: 'VAESA_RUN_UPDATE',
 }
 
 // Background → page push (sync progress, MQTT events...). Forward sang webapp qua postMessage.

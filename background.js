@@ -2430,6 +2430,41 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         // Trả response TRƯỚC khi reload để webapp biết lệnh đã nhận.
         setTimeout(() => chrome.runtime.reload(), 300)
         return { ok: true, reloading: true }
+      case 'VAESA_CHECK_UPDATE': {
+        // Hỏi GitHub bản mới nhất (manifest.json trên master) → so với bản đang chạy.
+        const CUR = chrome.runtime.getManifest().version
+        try {
+          const url = 'https://raw.githubusercontent.com/vaesaltd-netizen/vaesa-extension/master/manifest.json?t=' + Date.now()
+          const r = await fetch(url, { cache: 'no-cache' })
+          const m = await r.json()
+          const newer = m?.version && cmpVersion(m.version, CUR) > 0
+          return { ok: true, current: CUR, latest: m?.version || null, hasUpdate: !!newer }
+        } catch (e) {
+          return { ok: false, current: CUR, error: String(e?.message || e) }
+        }
+      }
+      case 'VAESA_RUN_UPDATE': {
+        // Nhờ cầu nối (native host) chạy update.bat → tải bản mới về đĩa. Xong thì tự reload.
+        try {
+          const res = await new Promise((resolve) => {
+            let done = false
+            const to = setTimeout(() => { if (!done) { done = true; resolve({ ok: false, error: 'cau noi khong phan hoi (timeout)' }) } }, 120000)
+            try {
+              chrome.runtime.sendNativeMessage('com.vaesa.updater', { cmd: 'update' }, (resp) => {
+                if (done) return
+                done = true; clearTimeout(to)
+                if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message, noBridge: true })
+                else resolve(resp || { ok: false, error: 'khong co phan hoi' })
+              })
+            } catch (e) { clearTimeout(to); resolve({ ok: false, error: String(e?.message || e), noBridge: true }) }
+          })
+          // Cập nhật xong → reload để nạp bản mới (đợi response về web trước).
+          if (res?.ok) setTimeout(() => chrome.runtime.reload(), 500)
+          return res
+        } catch (e) {
+          return { ok: false, error: String(e?.message || e) }
+        }
+      }
       case 'VAESA_DEBUG_DUMP_THREAD': {
         // Debug only — fetch 1 raw thread of page và trả về toàn bộ object để inspect shape.
         const { pageId, beforeMs } = req.payload || {}
@@ -2524,6 +2559,17 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   })
   return true
 })
+
+// So 2 phiên bản dạng "a.b.c" → >0 nếu x mới hơn y, <0 nếu cũ hơn, 0 nếu bằng.
+function cmpVersion(x, y) {
+  const a = String(x).split('.').map((n) => parseInt(n, 10) || 0)
+  const b = String(y).split('.').map((n) => parseInt(n, 10) || 0)
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const d = (a[i] || 0) - (b[i] || 0)
+    if (d) return d > 0 ? 1 : -1
+  }
+  return 0
+}
 
 // ============== AUTO-RELOAD KHI FILE DISK ĐƯỢC UPDATE ==============
 // Vấn đề: update.bat (qua VBS Startup) overwrite các file extension trên disk, nhưng Chrome

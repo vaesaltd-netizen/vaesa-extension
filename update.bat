@@ -30,14 +30,18 @@ echo [%time%] ZIP path: %ZIP% >> "%LOG%"
 
 if not defined AUTO echo [1/3] Dang tai ban moi nhat tu GitHub...
 echo [%time%] [1/3] curl tai ZIP... >> "%LOG%"
-curl -L -f --retry 3 --retry-delay 2 --connect-timeout 20 -o "%ZIP%" "https://github.com/vaesaltd-netizen/vaesa-extension/archive/refs/heads/master.zip" >> "%LOG%" 2>&1
+REM --ssl-no-revoke: mang/tuong lua NV chan kiem tra thu hoi chung chi (CRYPT_E_NO_REVOCATION_CHECK,
+REM loi that tren may NV 19/10) → curl schannel tu choi tai. Bo kiem tra thu hoi de van tai duoc.
+curl --ssl-no-revoke -L -f --retry 3 --retry-delay 2 --connect-timeout 20 -o "%ZIP%" "https://github.com/vaesaltd-netizen/vaesa-extension/archive/refs/heads/master.zip" >> "%LOG%" 2>&1
 set "CURL_EXIT=%ERRORLEVEL%"
 echo [%time%] curl exit code: %CURL_EXIT% >> "%LOG%"
 
 REM curl exit 0 nhung file co the bi AV xoa — thu lai bang PowerShell.
 if exist "%ZIP%" goto :zip_ok
 echo [%time%] curl khong tao duoc file, thu PowerShell... >> "%LOG%"
-powershell -NoProfile -Command "try{Invoke-WebRequest -Uri 'https://github.com/vaesaltd-netizen/vaesa-extension/archive/refs/heads/master.zip' -OutFile $env:TEMP+'\vaesa_update.zip' -UseBasicParsing}catch{exit 1}" >> "%LOG%" 2>&1
+REM OutFile phai la mot chuoi dung: "$env:TEMP\vaesa_update.zip" (ban cu $env:TEMP+'\...' ghi sai cho).
+REM TLS1.2 + bo kiem tra chung chi cho khop voi curl --ssl-no-revoke.
+powershell -NoProfile -Command "try{[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;[Net.ServicePointManager]::ServerCertificateValidationCallback={$true};Invoke-WebRequest -Uri 'https://github.com/vaesaltd-netizen/vaesa-extension/archive/refs/heads/master.zip' -OutFile \"$env:TEMP\vaesa_update.zip\" -UseBasicParsing}catch{exit 1}" >> "%LOG%" 2>&1
 if exist "%ZIP%" goto :zip_ok
 goto :fail_download
 

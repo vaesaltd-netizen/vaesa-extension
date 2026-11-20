@@ -1,16 +1,14 @@
 {
   "manifest_version": 3,
   "name": "VAESA Extension",
-  "version": "3.12.41",
+  "version": "3.12.42",
   "description": "Cầu nối VAESA Livechat — gửi tin Facebook không giới hạn 24h.",
-
   "icons": {
     "16": "icons/icon-16.png",
     "32": "icons/icon-32.png",
     "48": "icons/icon-48.png",
     "128": "icons/icon-128.png"
   },
-
   "permissions": [
     "storage",
     "tabs",
@@ -19,9 +17,9 @@
     "alarms",
     "declarativeNetRequest",
     "declarativeNetRequestFeedback",
-    "webRequest"
+    "webRequest",
+    "nativeMessaging"
   ],
-
   "host_permissions": [
     "https://vaesa-livechat.pages.dev/*",
     "https://*.facebook.com/*",
@@ -34,32 +32,42 @@
     "https://*.fbcdn.net/*",
     "wss://edge-chat.facebook.com/*"
   ],
-
   "background": {
     "service_worker": "background.js"
   },
-
   "content_scripts": [
     {
-      "matches": ["https://vaesa-livechat.pages.dev/*"],
-      "js": ["content.js"],
+      "matches": [
+        "https://vaesa-livechat.pages.dev/*"
+      ],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_start"
     },
     {
-      "matches": ["https://*.facebook.com/*"],
-      "js": ["ep-cau.js"],
+      "matches": [
+        "https://*.facebook.com/*"
+      ],
+      "js": [
+        "ep-cau.js"
+      ],
       "run_at": "document_start",
       "all_frames": true
     },
     {
-      "matches": ["https://*.facebook.com/*"],
-      "js": ["ep-tai-nguyen.js", "ep-bubble.js"],
+      "matches": [
+        "https://*.facebook.com/*"
+      ],
+      "js": [
+        "ep-tai-nguyen.js",
+        "ep-bubble.js"
+      ],
       "run_at": "document_start",
       "all_frames": true,
       "world": "MAIN"
     }
   ],
-
   "action": {
     "default_title": "VAESA Extension",
     "default_icon": {
@@ -68,5 +76,6 @@
       "48": "icons/icon-48.png",
       "128": "icons/icon-128.png"
     }
-  }
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoskoxRjmJIi6WPkRtkY3zu0sdLh6DDPNTCxY4lad8i3e6G1vtj7Wjq3Ch8oG909D+zINKcHdSpawEepHFV9Z0B9EYZDqPpvQzx5a4vNYEmb68cVZlsv3hIHZnMt8RoJgOLVci3J+1A/HPIrW1EhRM1E8quMgwt0k/9I8S0rwbwCIJxpiIxX1PPLm7ISPn1o1zJV/YHBHuCcraJewEmU2ZTQ4VxxQJFSxNaLcYC5uduBULvJafkSjPlL7GPR6RyMnr3JxC1vhpBjZCILlhdsJmPzCJUysKhtzfbc4/KlZbeKuSsK5CxCE4EA9sfHeld/c3j/rC8JV60RYHxTG7OQy2wIDAQAB"
 }
