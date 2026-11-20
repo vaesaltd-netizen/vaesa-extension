@@ -1978,6 +1978,136 @@ async function pageHangMuc() { // s() 3732:12497-12517: /fb_page_categories?loca
   di(r.data)
   return { ok: true, options: out }
 }
+
+// ── "Danh tính Page" (SMIT Connect fetch-as-actor / upload-image — các công cụ Đổi tên, Đổi ảnh, Bật/Tắt nhắn tin, Đổi trạng thái Page) ──
+// LƯU Ý QUAN TRỌNG (đọc mã): bản tiện ích SMIT Connect trong máy KHÔNG có mã xử lý fetch-as-actor / upload-image (docs/modules/smit/
+// cong-cu-page.md §5: "NOT FOUND" — không rõ SMIT đổi phiên sang hồ sơ Page bằng cookie/header gì, cũng như tên trường multipart tải ảnh).
+// Vì CẤM bịa, hai lệnh dưới chỉ gọi fetch kèm cookie phiên hiện tại (credentials:'include'); danh tính Page do tham số av/__user trong THÂN
+// yêu cầu GraphQL quyết định (đã chứng minh qua page-thong-tin av=Page). Với endpoint web không-GraphQL (name.php), danh tính là hồ sơ đang
+// hoạt động của phiên — KHÔNG tự đổi cookie sang NPE. Trang web tự kiểm "acting id === profileId" (như SMIT) nên nếu phiên không ở đúng Page
+// thì báo lỗi, KHÔNG đổi nhầm. Chỉ cho gọi facebook.com (như open-tab / as-csv).
+async function fetchNhuPage({ npeId, url, options = {} }) { // ey (1927:2583-2671): { npeId, url, options } ⇒ body
+  let u
+  try { u = new URL(String(url)) } catch { return { ok: false, message: 'Đường dẫn không hợp lệ' } }
+  if (u.protocol !== 'https:' || !/(^|\.)facebook\.com$/i.test(u.hostname)) return { ok: false, message: 'Chỉ gọi được facebook.com' }
+  const o = { credentials: 'include', ...options }
+  if (o.method && String(o.method).toUpperCase() === 'GET') delete o.body
+  let res
+  try { res = await fetch(u.toString(), o) } catch (e) { return { ok: false, message: `Lỗi kết nối mạng: ${e?.message || e}` } }
+  let body
+  try { body = await res.text() } catch (e) { return { ok: false, message: `Không đọc được phản hồi: ${e?.message || e}` } }
+  return { ok: true, body, status: res.status, finalUrl: res.url, npeId: npeId ?? null }
+}
+// upload-image (1927:1529-1560): { npeId, url, fileType, fileBase64, data{profileId,fbDtsg,lsd,jazoest} } ⇒ { ok, status, fbid }.
+// ⚠ TÊN TRƯỜNG MULTIPART của endpoint /profile/picture/upload/ KHÔNG đọc được từ SMIT Connect (cong-cu-page.md §5: NOT FOUND) — phần dựng
+// form dưới đây SUY LUẬN theo chuẩn tải ảnh web Facebook (source + fb_dtsg/lsd/jazoest), CHƯA kiểm chứng trên Page thật. Cần thử thật trước khi tin.
+async function uploadAnhNhuPage({ npeId, url, fileType, fileBase64, data = {} }) {
+  let u
+  try { u = new URL(String(url)) } catch { return { ok: false, code: 'bad-url', message: 'Đường dẫn không hợp lệ' } }
+  if (u.protocol !== 'https:' || !/(^|\.)facebook\.com$/i.test(u.hostname)) return { ok: false, code: 'bad-url', message: 'Chỉ tải lên facebook.com' }
+  let bin
+  try { bin = Uint8Array.from(atob(String(fileBase64 || '')), (x) => x.charCodeAt(0)) } catch { return { ok: false, code: 'bad-image', message: 'Ảnh không hợp lệ' } }
+  const fd = new FormData()
+  if (data.profileId) fd.append('profile_id', String(data.profileId))
+  if (data.fbDtsg) fd.append('fb_dtsg', String(data.fbDtsg))
+  if (data.lsd) fd.append('lsd', String(data.lsd))
+  if (data.jazoest) fd.append('jazoest', String(data.jazoest))
+  fd.append('__a', '1')
+  fd.append('source', new Blob([bin], { type: fileType || 'image/jpeg' }), fileType === 'image/png' ? 'photo.png' : 'photo.jpg')
+  let res
+  try { res = await fetch(u.toString(), { method: 'POST', credentials: 'include', body: fd }) } catch (e) { return { ok: false, code: 'network', message: `Lỗi tải ảnh: ${e?.message || e}` } }
+  const raw = await res.text()
+  let j
+  try { j = JSON.parse(raw.startsWith('for (;;);') ? raw.slice(9) : raw) } catch { j = null }
+  const fbid = j?.payload?.fbid ?? j?.payload?.photo_id ?? j?.fbid ?? raw.match(/"fbid"\s*:\s*"?(\d+)"?/)?.[1]
+  if (fbid && /^\d+$/.test(String(fbid))) return { ok: true, status: res.status, fbid: String(fbid), npeId: npeId ?? null }
+  return { ok: false, status: res.status, code: 'no-fbid', message: j?.error?.message || j?.errorSummary || 'Facebook did not return an uploaded photo ID' }
+}
+
+// Bật/Tắt nhận tin nhắn (1128:17662-17695 ep): GraphQL www useCometUSFToggleMutation av=Page (như page-thong-tin, không cần đổi phiên).
+async function pageBatTatNhanTin({ profileId, on }) {
+  if (!/^\d+$/.test(String(profileId ?? ''))) return { ok: false, message: 'thiếu profile id của Page (NPE)' }
+  const r = await goiGraphql('www', { fb_api_req_friendly_name: 'useCometUSFToggleMutation', doc_id: '25466688156365768',
+    variables: JSON.stringify({ input: { actor_id: profileId, client_mutation_id: '1', entry_point: 'privacy_checkup', group_id: null, node_id: 'PAGE_MESSAGING', settings_tree: 'FACEBOOK_SETTINGS', value: !!on } }) },
+    { them: relayBm({ av: profileId, __user: profileId }) })
+  if (r.error) return { ok: false, message: r.message }
+  return r.data?.xfb_usf_update_toggle?.value !== (on ? '1' : '0')
+    ? { ok: false, message: 'Facebook không xác nhận thay đổi — giá trị trả về không khớp trạng thái yêu cầu' }
+    : { ok: true, message: on ? 'đã bật nhắn tin' : 'đã tắt nhắn tin' }
+}
+// Đổi trạng thái Page (97056 s / kich-hoat-huy-dang): GraphQL www useRepublishMutation / useUnpublishMutation av=Page.
+async function pageDoiTrangThai({ profileId, publish }) {
+  if (!/^\d+$/.test(String(profileId ?? ''))) return { ok: false, message: 'thiếu profile id của Page (NPE)' }
+  const r = await goiGraphql('www', { fb_api_req_friendly_name: publish ? 'useRepublishMutation' : 'useUnpublishMutation', doc_id: publish ? '9665602063553888' : '9678811222195266',
+    variables: JSON.stringify({ profile_id: profileId }) }, { them: relayBm({ av: profileId, __user: profileId }) })
+  if (r.error) return { ok: false, message: r.message }
+  const v = publish ? r.data?.xfb_republish_profile : r.data?.xfb_unpublish_profile
+  return v !== (publish ? 'PUBLISHED' : 'DRAFT') ? { ok: false, message: 'Facebook chưa xác nhận đổi trạng thái Page' } : { ok: true, message: publish ? 'đã kích hoạt Page' : 'đã huỷ đăng Page' }
+}
+// Gỡ giới hạn quốc gia của Page (36763 S): GraphQL www CountryRestrictionSettingMutation av=Page — phần duy nhất của "Đặt giới hạn trang" cần danh tính Page.
+async function pageGoQuocGia({ profileId }) {
+  if (!/^\d+$/.test(String(profileId ?? ''))) return { ok: false, message: 'thiếu profile id của Page (NPE)' }
+  const r = await goiGraphql('www', { fb_api_req_friendly_name: 'CountryRestrictionSettingMutation', doc_id: '9629790297112029',
+    variables: JSON.stringify({ input: { country_list: [], is_blocklist: true, actor_id: profileId, client_mutation_id: '1' } }) }, { them: relayBm({ av: profileId, __user: profileId }) })
+  if (r.error) return { ok: false, message: r.message }
+  return r.data?.country_restriction_mutation?.success === true ? { ok: true, message: 'đã gỡ giới hạn quốc gia' } : { ok: false, unverified: true, message: JSON.stringify(r).slice(0, 300) }
+}
+// Đặt ảnh đã tải thành avatar / ảnh bìa (1128:17180-17226 z, 17300-17358 Y): GraphQL www av=Page. fbid do upload-anh-nhu-page trả về.
+async function pageDatAnh({ profileId, loai, fbid }) {
+  if (!/^\d+$/.test(String(profileId ?? ''))) return { ok: false, message: 'thiếu profile id của Page (NPE)' }
+  if (!/^\d+$/.test(String(fbid ?? ''))) return { ok: false, message: 'thiếu mã ảnh đã tải (fbid)' }
+  if (loai === 'avatar') {
+    const r = await goiGraphql('www', { fb_api_req_friendly_name: 'ProfileCometProfilePictureSetMutation', doc_id: '26996880216606251', server_timestamps: 'true',
+      variables: JSON.stringify({ input: { attribution_id_v2: '', caption: '', existing_photo_id: String(fbid), expiration_time: null, profile_id: profileId, profile_pic_method: 'EXISTING', profile_pic_source: 'TIMELINE',
+        scaled_crop_rect: { height: 0.99536, width: 1, x: 0, y: 0.00232 }, skip_cropping: true, actor_id: profileId, client_mutation_id: '1' }, isPage: false, isProfile: true, scale: 1,
+        __relay_internal__pv__ProfileGeminiIsCoinFlipEnabledrelayprovider: false }) }, { them: relayBm({ av: profileId, __user: profileId }) })
+    if (r.error) return { ok: false, message: `Đặt avatar thất bại: ${r.message}` }
+    if (r.data?.profile_picture_set?.profile?.id !== profileId) return { ok: false, message: 'Facebook chưa xác nhận avatar mới' }
+    return { ok: true, message: 'Đã đổi avatar', imageUrl: r.data?.profile_picture_set?.profile?.profilePicLarge?.uri || '' }
+  }
+  const r = await goiGraphql('www', { fb_api_req_friendly_name: 'ProfileCometCoverPhotoUpdateMutation', doc_id: '26648951184714383', server_timestamps: 'true',
+    variables: JSON.stringify({ input: { attribution_id_v2: '', cover_photo_id: String(fbid), focus: { x: 0.5, y: 0.5 }, target_user_id: profileId, actor_id: profileId, client_mutation_id: '1' }, scale: 1, contextualProfileContext: null }) },
+    { them: relayBm({ av: profileId, __user: profileId }) })
+  if (r.error) return { ok: false, message: `Đặt ảnh bìa thất bại: ${r.message}` }
+  if (r.data?.user_update_cover_photo?.user?.cover_photo?.photo?.id !== String(fbid)) return { ok: false, message: 'Facebook chưa xác nhận ảnh bìa mới' }
+  return { ok: true, message: 'Đã đổi ảnh bìa' }
+}
+
+// Lấy link kháng BM (12570 d): trang hỗ trợ ⇒ enforcement_instance ⇒ mở/tạo kháng nghị ⇒ link checkpoint (4941 Z). Chỉ dựng/lấy URL, không đổi quyền ai.
+const diaChiKhang = (id) => `https://www.facebook.com/checkpoint/1501092823525282/${encodeURIComponent(id)}`
+async function gqlCoTen(host, friendly, variables, extra = {}) { // UG friendlyNameInRequest: tên truy vấn ở URL + header x-fb-friendly-name
+  const token = await getAdsToken()
+  const body = new URLSearchParams({ locale: 'en_US', __a: '1', fb_api_req_friendly_name: friendly, fb_api_caller_class: 'RelayModern', server_timestamps: 'true', doc_id: extra.doc_id, variables: JSON.stringify(variables),
+    fb_dtsg: token.fb_dtsg || '', lsd: token.lsd || '', __comet_req: '1', jazoest: jazoest(token.fb_dtsg || ''), ...(extra.them || {}) })
+  const res = await fetch(`https://${host}.facebook.com/api/graphql/?${new URLSearchParams({ fb_api_req_friendly_name: friendly })}`, { method: 'POST', credentials: 'include',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-fb-friendly-name': friendly, 'x-asbd-id': '1' }, body: body.toString() })
+  return docGraphql(await res.text())
+}
+async function khangCanSelfie(appealId) { // c(): CometIXTFacebookXfacBvTriggerRootQuery ⇒ màn đầu có phải chụp selfie không
+  try {
+    const r = await gqlCoTen('www', 'CometIXTFacebookXfacBvTriggerRootQuery', { input: { business_verification_design_system: 'COMET', business_verification_ui_type: 'ACCOUNT_QUALITY', trigger_event_type: 'XFAC_BV_PAID_ACTOR_APPEAL_ENTRY',
+      xfac_id: appealId, xfac_interop_dismiss_flow_for_xfac_challenges_desktop_only: true, nt_context: null, trigger_session_id: (crypto.randomUUID?.() || String(Date.now())) }, scale: 1 }, { doc_id: '29422250940742145' })
+    return !r.error && r.data?.ixt_xfac_bv_trigger?.screen?.view_model?.__typename === 'IXTSelfieCaptureFlowOnboardingScreenViewModel'
+  } catch { return false }
+}
+async function bmLayLinkKhang({ bmId }) {
+  if (!/^\d+$/.test(String(bmId ?? ''))) return { ok: false, raw: 'BM ID không hợp lệ' }
+  let html
+  try { html = await (await fetch(`https://business.facebook.com/business-support-home/${encodeURIComponent(bmId)}/?tab=available_for_review&source=link&asset_view_type=customer_feedback`, { credentials: 'include' })).text() }
+  catch (e) { return { ok: false, raw: String(e?.message || e) } }
+  const inst = html.match(/"idesEnforcementInstanceID"\s*:\s*"?(\d+)"?/)?.[1]
+  if (!inst) return { ok: false, reason: /"business_role"\s*:\s*"EMPLOYEE"/.test(html) ? 'notAdmin' : 'noQueue' }
+  let userId
+  try { userId = (await getAdsToken()).user_id } catch (e) { return { ok: false, raw: String(e?.message || e) } }
+  let g
+  try { g = await gqlCoTen('business', 'useBSHGAMEOpenXFACAppealActionMutation', { input: { actor_id: userId, client_mutation_id: '1', enforcement_instance: inst } }, { doc_id: '29485441471102331' }) }
+  catch (e) { return { ok: false, raw: String(e?.message || e) } }
+  if (g.error) return { ok: false, raw: g.message }
+  const appealId = g.data?.xfb_XFACGraphQLAppealManagerFetchOrCreateAppeal?.xfac_appeal_id
+  if (typeof appealId !== 'string' || !/^\d+$/.test(appealId)) return { ok: false, reason: 'noAppealId' }
+  return { ok: true, url: diaChiKhang(appealId), selfie: await khangCanSelfie(appealId) }
+}
+
 // Page bị vô hiệu hoá / chờ xoá của chính tài khoản (3732 i(): GraphQL legacy graph.facebook.com/graphql, mã token_graphql rồi token_g).
 async function maLegacy() { // 1927:2191-2201: bootloader ReactComposerStatusEagerAttachment ⇒ EAAHULp…
   const t = await (await fetch('https://www.facebook.com/ajax/bootloader-endpoint/?modules=ReactComposerStatusEagerAttachment.react&__a=1', { credentials: 'include' })).text()
@@ -2293,6 +2423,8 @@ const CONG_CU = { 'check-hold': checkHold, 'check-location-verification': checkL
   'bm-page-ds': bmBoc(bmPageDs), 'page-kich-hoat': bmBoc(pageKichHoat),
   'page-me-tkqc': bmBoc(pageMeTkqc), 'page-tao': bmBoc(pageTao), 'page-bai-ds': bmBoc(pageBaiDs), 'page-bai-xoa': bmBoc(pageBaiXoa), 'page-gioi-han-doc': pageGioiHanDoc,
   'page-gioi-han-ghi': pageGioiHanGhi, 'page-thong-tin': bmBoc(pageThongTin), 'page-hang-muc': bmBoc(pageHangMuc), 'page-tat-cua-toi': bmBoc(pageTatCuaToi), 'phien-fb': phienFb,
+  'fetch-nhu-page': bmBoc(fetchNhuPage), 'upload-anh-nhu-page': bmBoc(uploadAnhNhuPage), 'page-bat-tat-nhan-tin': bmBoc(pageBatTatNhanTin), 'page-doi-trang-thai': bmBoc(pageDoiTrangThai),
+  'page-go-quoc-gia': bmBoc(pageGoQuocGia), 'page-dat-anh': bmBoc(pageDatAnh), 'bm-lay-link-khang': bmBoc(bmLayLinkKhang),
   'qlqc-tkqc': qlqcTkqc, 'qlqc-cap': qlqcCap, 'qlqc-ghi': qlqcGhi,
   'as-tkqc': asTkqc, 'as-tkqc-id': asTkqcId, 'as-xuat': asXuat, 'as-hoi': asHoi, 'as-csv': asCsv }
 async function runTool(fn, payload) {
