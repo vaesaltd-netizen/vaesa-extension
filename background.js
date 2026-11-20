@@ -2249,12 +2249,25 @@ chrome.runtime.onInstalled.addListener(async () => {
   } catch (e) {}
 })
 
+// Phiên VAESA cho Bubble Extended Payment lấy tỷ giá (VAESA_EP_TY_GIA): service worker hay bị Chrome dừng (mất biến
+// vaesaSessionToken) ⇒ giữ một bản trong chrome.storage.session — chỉ nằm trong RAM, đóng trình duyệt là mất, content script
+// không đọc được (mức truy cập mặc định TRUSTED_CONTEXTS).
+let _epPhienDaGiu = ''
+function _epGiuPhien(tk) {
+  if (!tk || tk === _epPhienDaGiu) return
+  _epPhienDaGiu = tk
+  try { chrome.storage.session?.set({ vaesa_phien_ep: tk })?.catch?.(() => {}) } catch (e) {}
+}
+
 chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
   console.log('[VAESA Bridge] msg in:', req?.action)
+  // Cầu nối Bubble Extended Payment (ep-cau.js chạy trên *.facebook.com) chỉ được gọi lệnh VAESA_EP_* — không lệnh nào khác.
+  if (/^https:\/\/([^/]+\.)?facebook\.com\//i.test(sender?.url || '') && !String(req?.action || '').startsWith('VAESA_EP_')) return false
   // Chỉ nhận session do content script của đúng webapp chuyển sang. Service worker có thể
   // bị Chrome dừng/rồi chạy lại; mỗi message từ webapp sẽ nạp lại token hiện hành.
   if (sender?.url?.startsWith('https://vaesa-livechat.pages.dev/')) {
     vaesaSessionToken = String(req?.vaesaSession || '')
+    _epGiuPhien(vaesaSessionToken)
   }
   const dispatch = async () => {
     switch (req?.action) {
@@ -2491,6 +2504,15 @@ chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
         if (req.payload?.value == null) await chrome.storage.local.remove(key)
         else await chrome.storage.local.set({ [key]: req.payload.value })
         return { ok: true }
+      }
+      // Bubble Extended Payment — tỷ giá "Tự động" mỗi ngày (SMIT hook.js:2054-2072 gọi gateway.smit.vn/public/usd-ratio-exchange;
+      // VAESA gọi máy VAESA). Trả nguyên chữ để Bubble kiểm "success/date/rates" như SMIT.
+      case 'VAESA_EP_TY_GIA': {
+        let phien = vaesaSessionToken
+        if (!phien) { try { phien = (await chrome.storage.session.get('vaesa_phien_ep'))?.vaesa_phien_ep || '' } catch (e) {} }
+        if (!phien) return { ok: false, error: 'Chưa có phiên VAESA' }
+        const r = await fetch('https://vaesa-livechat.pages.dev/api/ads-control/smit/ty-gia', { headers: { 'x-vaesa-session': phien } })
+        return { ok: r.ok, text: await r.text() }
       }
       default:
         return { ok: false, error: 'Unknown action: ' + req?.action }

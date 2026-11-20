@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "VAESA Extension",
-  "version": "3.12.39",
+  "version": "3.12.40",
   "description": "Cầu nối VAESA Livechat — gửi tin Facebook không giới hạn 24h.",
 
   "icons": {
@@ -44,6 +44,19 @@
       "matches": ["https://vaesa-livechat.pages.dev/*"],
       "js": ["content.js"],
       "run_at": "document_start"
+    },
+    {
+      "matches": ["https://*.facebook.com/*"],
+      "js": ["ep-cau.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": ["https://*.facebook.com/*"],
+      "js": ["ep-tai-nguyen.js", "ep-bubble.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
     }
   ],
 
