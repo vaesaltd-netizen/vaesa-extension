@@ -2029,12 +2029,19 @@ async function uploadAnhNhuPage({ npeId, url, fileType, fileBase64, data = {} })
 // không đổi phiên nên av=profileId ⇒ fb_dtsg vẫn của USER ⇒ Facebook báo "Hãy thử làm mới trang...". Mẫu CHẠY ĐƯỢC: pageKichHoat (ReactivateProfile
 // Mutation) thao tác hồ sơ NPE với __user=user_id (chính mình), profile ở variables. Dùng lại mẫu đó cho các mutation hồ sơ NPE dưới đây.
 const relayNguoiDung = () => (t) => ({ __comet_req: '1', fb_api_caller_class: 'RelayModern', jazoest: jazoest(t.fb_dtsg || ''), av: t.user_id || '', __user: t.user_id || '' })
+// CHẨN ĐOÁN (20/11): doc_id + variables khớp HỆT SMIT, nhưng đóng vai USER trả "Lỗi thực hiện truy vấn." (khác republish chạy được). USF toggle
+// (settings_tree) có thể BẮT BUỘC đóng vai đúng hồ sơ (av=profileId + đổi phiên). Fetch thẳng để bắt status + body + mã lỗi FB mà đo.
 async function pageBatTatNhanTin({ profileId, on }) {
   if (!/^\d+$/.test(String(profileId ?? ''))) return { ok: false, message: 'thiếu profile id của Page (NPE)' }
-  const r = await goiGraphql('www', { fb_api_req_friendly_name: 'useCometUSFToggleMutation', doc_id: '25466688156365768',
-    variables: JSON.stringify({ input: { actor_id: profileId, client_mutation_id: '1', entry_point: 'privacy_checkup', group_id: null, node_id: 'PAGE_MESSAGING', settings_tree: 'FACEBOOK_SETTINGS', value: !!on } }) },
-    { them: relayNguoiDung() })
-  if (r.error) return { ok: false, message: r.message }
+  const token = await getAdsToken()
+  const body = new URLSearchParams({ locale: 'en_US', __a: '1', fb_api_req_friendly_name: 'useCometUSFToggleMutation', doc_id: '25466688156365768',
+    variables: JSON.stringify({ input: { actor_id: profileId, client_mutation_id: '1', entry_point: 'privacy_checkup', group_id: null, node_id: 'PAGE_MESSAGING', settings_tree: 'FACEBOOK_SETTINGS', value: !!on } }),
+    fb_dtsg: token.fb_dtsg || '', lsd: token.lsd || '', __comet_req: '1', fb_api_caller_class: 'RelayModern', jazoest: jazoest(token.fb_dtsg || ''), av: token.user_id || '', __user: token.user_id || '' })
+  let res, rawText
+  try { res = await fetch('https://www.facebook.com/api/graphql/', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-asbd-id': '1' }, body: body.toString() }); rawText = await res.text() }
+  catch (e) { return { ok: false, message: `lỗi mạng: ${e?.message || e}` } }
+  const r = docGraphql(rawText)
+  if (r.error) return { ok: false, message: r.message, ...(r.code !== undefined ? { code: r.code } : {}), rawStatus: res.status, raw: String(rawText).replace(/^for \(;;\);/, '').slice(0, 1000) }
   return r.data?.xfb_usf_update_toggle?.value !== (on ? '1' : '0')
     ? { ok: false, message: 'Facebook không xác nhận thay đổi — giá trị trả về không khớp trạng thái yêu cầu', raw: JSON.stringify(r?.data ?? r ?? null).slice(0, 700) }
     : { ok: true, message: on ? 'đã bật nhắn tin' : 'đã tắt nhắn tin' }
