@@ -460,6 +460,50 @@ const LENH = {
     const done = revokeOk && remaining.length === 0
     return { ok: done, remainingApps: remaining, message: done ? `${id}: đã xoá` : !revokeOk ? `${id}: không thu hồi được token` : `${id}: còn ${remaining.length} app chưa gỡ` }
   },
+
+  // ═══ 15. backup-bm: mời email vào BM — thử 3 cách (1128:12620-12750 eF/eD/tf) ═══
+  'ss-bm-backup-email': async ({ bm, email, role } = {}) => {
+    const b = so(bm)
+    if (!SO.test(b)) return sai('ID BM')
+    if (!email || !email.includes('@')) return sai('email')
+    const r = role === 'employee' ? 'employee' : 'admin'
+    const ADMIN_ROLES = ['DEFAULT', 'MANAGE', 'DEVELOPER', 'EMPLOYEE', 'ASSET_MANAGE', 'ASSET_VIEW', 'PEOPLE_MANAGE', 'PEOPLE_VIEW', 'PARTNERS_VIEW', 'PARTNERS_MANAGE', 'PROFILE_MANAGE']
+    const EMP_ROLES = ['DEFAULT', 'EMPLOYEE']
+    const roles = r === 'admin' ? ADMIN_ROLES : EMP_ROLES
+    const parse = (body) => { if (!body) return null; const t = body.startsWith('for (;;);') ? body.slice(9) : body; try { return JSON.parse(t) } catch { return null } }
+    const check = (resp) => {
+      if (loiGraph(resp)) return { ok: false, message: resp.message || resp.error?.message || resp.error?.error_user_msg || 'Facebook từ chối lời mời' }
+      if (!resp) return { ok: false, message: 'Không nhận được phản hồi' }
+      if (resp.error) return { ok: false, message: resp.error.message || resp.error.error_user_msg || resp.error.error_user_title || 'Facebook từ chối lời mời' }
+      const id = resp.id?.toString().trim()
+      return id ? { ok: true, message: `Đã mời ${email} (invite ${id})` } : { ok: false, message: 'Không nhận được ID lời mời' }
+    }
+    // method 3: POST /{bm}/business_users v17.0
+    try {
+      const r3 = await N.jbGoi(`/${b}/business_users`, { method: 'POST', version: 'v17.0', body: { email, role: r === 'admin' ? 'ADMIN' : 'EMPLOYEE' } })
+      const c3 = check(r3)
+      if (c3.ok) return c3
+    } catch { /* fallthrough */ }
+    // method 2: POST z-p3-graph v3.0 with cppo
+    try {
+      const r2 = await N.jbGoi(`/${b}/business_users`, { method: 'POST', tokenPurpose: 'businessManagerAction', params: { __cppo: 1 }, body: { brandId: b, email, method: 'post', pretty: '0', roles: JSON.stringify(roles), suppress_http_code: '1' } })
+      const c2 = check(r2)
+      if (c2.ok) return c2
+    } catch { /* fallthrough */ }
+    // method 1: batch POST via adsmanager-graph
+    try {
+      const batch = [{ method: 'POST', relative_url: `/v3.0/${b}/business_users`, body: new URLSearchParams({ brandId: b, email, roles: JSON.stringify(roles) }).toString() }]
+      const r1 = await N.jbGoi('', { baseUrl: 'https://adsmanager-graph.facebook.com/v17.0', method: 'POST', body: { batch: JSON.stringify(batch), method: 'post', pretty: '0', suppress_http_code: '1' } })
+      if (loiGraph(r1)) return { ok: false, message: r1.message || 'Batch invite thất bại' }
+      const item = Array.isArray(r1) ? r1[0] : null
+      if (item?.code === 200 || item?.body) {
+        const parsed = parse(item.body)
+        if (parsed) return check(parsed)
+      }
+      return { ok: false, message: `Batch trả mã ${item?.code ?? '???'}` }
+    } catch { /* fallthrough */ }
+    return { ok: false, message: `Không gửi được lời mời cho ${email}` }
+  },
 }
 self.vaesaSmitThem = Object.assign(self.vaesaSmitThem || {}, LENH)
 })()
