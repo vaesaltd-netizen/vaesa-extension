@@ -958,7 +958,8 @@ async function jbGoi(path, { version = 'v24.0', method = 'GET', params = {}, bod
     const res = await fetch(url, init)
     let j
     try { j = await res.json() } catch { return { error: true, message: 'Phản hồi Graph không hợp lệ' } }
-    if (j?.error) return { error: true, message: j.error.message || j.error.error_user_msg || j.error.error_user_title || 'Graph error', code: j.error.code }
+    if (j?.error) return { error: true, message: j.error.message || j.error.error_user_msg || j.error.error_user_title || 'Graph error', code: j.error.code,
+      ...(typeof j.error.error_user_title === 'string' && j.error.error_user_title.trim() ? { userTitle: j.error.error_user_title.trim() } : {}) }
     return j
   }
   const r = await chay(await getAdsToken())
@@ -2089,6 +2090,162 @@ async function openTab({ url }) {
 }
 
 // Một cửa cho các công cụ mới (trang gọi FB_TOOL { fn, payload }) — đỡ phải thêm lệnh riêng cho từng công cụ.
+// ── Trình quản lý QC (SMIT ads-manager 6604) ─────────────────────────────────────────────────────────────────────────────
+// Tab TKQC: rb() 6604:9382-9482 — GET /me/adaccounts 500/trang, theo paging.next tuần tự; vai trò qua userpermissions khi có user_id số.
+const TRUONG_TKQC_QLQC = ['name', 'account_id', 'account_status', 'currency', 'owner_business{id,name}', 'is_prepay_account'] // rg
+const VAI_TRO_QLQC = { ADMIN: 'admin', 1001: 'admin', '281423141961500': 'admin', ADVERTISER: 'advertiser', 1002: 'advertiser', '461336843905730': 'advertiser',
+  ANALYST: 'analyst', 1003: 'analyst', '498940650138739': 'analyst', 1000: 'DRAFT', '610690166001223': 'DRAFT' } // rv
+const vaiTroQlqc = (e) => { if (e == null) return null; const t = String(e).trim(); return t ? VAI_TRO_QLQC[t.toUpperCase()] ?? t : null } // rh
+const SO_QLQC = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i
+const soQlqc = (e) => { // rt / po
+  if (typeof e === 'number') return Number.isFinite(e) ? e : null
+  if (typeof e !== 'string') return null
+  const t = e.trim()
+  if (!SO_QLQC.test(t)) return null
+  const n = Number(t)
+  return Number.isFinite(n) ? n : null
+}
+const boActQlqc = (s) => (s.startsWith('act_') ? s.slice(4) : s) // _
+async function qlqcTkqc() {
+  const uid = String((await getAdsToken().catch(() => null))?.user_id ?? '')
+  const l = { limit: 500, fields: (/^\d+$/.test(uid) ? [...TRUONG_TKQC_QLQC, `userpermissions.user(${uid}).as(user_roles)`] : TRUONG_TKQC_QLQC).join(','), summary: 1 }
+  const o = [], r = new Set(), i = new Set()
+  let n, s = '/me/adaccounts'
+  try {
+    while (s && !i.has(s)) {
+      i.add(s)
+      const e = await jbGoi(s, s.startsWith('https') ? {} : { params: l })
+      if (e?.error) return { ok: true, rows: o, total: n, error: { sourceId: 'me', message: e.message, ...(e.code !== undefined ? { code: e.code } : {}), ...(e.userTitle ? { userTitle: e.userTitle } : {}) } }
+      for (const x of e.data ?? []) {
+        const t = boActQlqc(String(x.account_id ?? x.id ?? '').trim())
+        if (!t || r.has(t)) continue
+        const bi = x.owner_business?.id, bn = x.owner_business?.name
+        const m = { id: t, name: x.name?.trim() || t, account_status: soQlqc(x.account_status) ?? 0, currency: x.currency ?? '',
+          owner_business: bi ? { id: String(bi), ...(bn ? { name: bn } : {}) } : null, user_role: vaiTroQlqc(x.user_roles?.data?.[0]?.role) }
+        if (typeof x.is_prepay_account === 'boolean') m.is_prepay_account = x.is_prepay_account
+        r.add(t); o.push(m)
+      }
+      n = e.summary?.total_count ?? n
+      s = e.paging?.next || null
+    }
+  } catch (e) {
+    return { ok: true, rows: o, total: n, error: { sourceId: 'me', message: e instanceof Error ? e.message : String(e) } }
+  }
+  return { ok: true, rows: o, total: n }
+}
+
+// Cấp Chiến dịch / Nhóm QC / QC: transport pw 6604:19363-19449 (pf/py/pb 19250-19351, pu/pc/pd/pp/pm 19214-19249, d7 19090).
+// Mỗi lần gọi = một bước cho MỘT cha (đọc hết các trang); trang điều phối 4 luồng, bỏ câu trả lời trễ.
+const CANH_QLQC = { campaign: 'campaigns', adset: 'adsets', ad: 'ads' } // pm
+const chaQlqc = (level, id) => `/${level !== 'adaccount' || String(id).startsWith('act_') ? id : `act_${id}`}` // d7
+const goiQlqc = async (path, { method = 'GET', params, body }) => { // pf
+  try {
+    const n = await jbGoi(path, { method, ...(params ? { params } : {}), ...(body ? { body } : {}) })
+    if (n?.error) return { ok: false, reason: 'facebook', message: n.message, ...(n.code !== undefined ? { code: n.code } : {}), ...(n.userTitle ? { userTitle: n.userTitle } : {}) }
+    return { ok: true, data: n }
+  } catch (e) {
+    return { ok: false, reason: 'transport', message: e instanceof Error ? e.message : String(e) }
+  }
+}
+const goiQlqcThuong = (e) => { const t = {}; for (const [n, a] of Object.entries(e)) { if (a === undefined) continue; if (typeof a === 'object') { if (a.length > 0) t[n] = a.join(','); continue } t[n] = a } return t } // pu
+const locQlqc = (e) => (e.length > 0 ? JSON.stringify(e) : undefined) // pc
+const theoIdQlqc = (level, ids) => ({ field: `${level}.id`, operator: 'IN', value: ids }) // pd
+const ngayQlqc = (d) => ('preset' in d ? { date_preset: d.preset } : { time_range: JSON.stringify({ since: d.since, until: d.until }) }) // pp
+const KHONG_DS_QLQC = () => ({ ok: false, reason: 'invalid-response', message: 'Facebook answered without a data list' }) // pv
+const QUA_TRANG_QLQC = () => ({ ok: false, reason: 'invalid-response', message: 'Stopped after 100 pages without reaching the end of the list' }) // ph
+async function docGetQlqc(path, params) { // py
+  const l = []
+  let o = null
+  for (let r = 0; r < 100; r += 1) {
+    const k = o ? await goiQlqc(o, { method: 'GET' }) : await goiQlqc(path, { method: 'GET', params })
+    if (!k.ok) return k
+    if (!Array.isArray(k.data.data)) return KHONG_DS_QLQC()
+    l.push(...k.data.data)
+    const i = k.data.paging?.next
+    o = typeof i === 'string' && i !== '' ? i : null
+    if (!o) return { ok: true, data: l }
+  }
+  return QUA_TRANG_QLQC()
+}
+async function docPostQlqc(path, body) { // pb
+  const o = []
+  let l
+  for (let r = 0; r < 100; r += 1) {
+    const k = await goiQlqc(path, { method: 'POST', body: l ? { ...body, after: l } : body })
+    if (!k.ok) return k
+    if (!Array.isArray(k.data.data)) return KHONG_DS_QLQC()
+    o.push(...k.data.data)
+    if (!k.data.paging?.next) return { ok: true, data: o }
+    const i = k.data.paging.cursors?.after
+    if (typeof i !== 'string' || i === '') return { ok: false, reason: 'invalid-response', message: 'Facebook reported a next page without a cursor to reach it' }
+    l = i
+  }
+  return QUA_TRANG_QLQC()
+}
+const vatQlqc = (e) => (typeof e !== 'object' || e === null || Array.isArray(e) ? null : e) // pr
+const giaTriQlqc = (e) => { const t = soQlqc(e); if (t !== null) return t; if (Array.isArray(e)) return giaTriQlqc(e[0]); const n = vatQlqc(e); return n ? ('value' in n ? giaTriQlqc(n.value) : Array.isArray(n.values) ? giaTriQlqc(n.values[0]) : null) : null } // pi
+const tenCotQlqc = (e) => { const t = vatQlqc(e)?.name; return typeof t === 'string' && t !== '' ? t : null } // ps
+function tongQlqc(e) { // đọc am_tabular 19398-19431
+  const t = {}
+  if (!Array.isArray(e)) return t
+  const n = vatQlqc(e[0]), a = vatQlqc(n?.headers), l = n?.rows
+  if (!a || !Array.isArray(l)) return t
+  const o = vatQlqc(l[0])
+  if (!o) return t
+  const r = a.atomic_columns, i = o.atomic_values
+  if (Array.isArray(r) && Array.isArray(i)) r.forEach((c, k) => { const ten = tenCotQlqc(c), v = giaTriQlqc(i[k]); if (ten !== null && v !== null) t[ten] = v })
+  const s = a.action_columns, u = o.action_values
+  if (Array.isArray(s) && Array.isArray(u)) s.forEach((c, k) => {
+    const ten = tenCotQlqc(c), x = vatQlqc(u[k]), vs = x?.values
+    if (ten === null || !Array.isArray(vs) || vs.length === 0) return
+    const v = giaTriQlqc(vs[0])
+    if (v !== null) t[ten] = v
+    const ty = x?.types
+    if (x?.breakdown === 'action_type' && Array.isArray(ty)) ty.forEach((loai, j) => { if (typeof loai !== 'string' || loai === '') return; const g = soQlqc(vs[j]); if (g !== null) t[`${ten}:${loai}`] = g })
+  })
+  return t
+}
+async function qlqcCap({ buoc, cha, cap, fields = [], filtering = [], ids = [], dateRange, columns = [], accountId }) {
+  const dsCanh = (truong) => goiQlqcThuong({ limit: 500, date_preset: 'maximum', fields: truong, filtering: locQlqc(filtering) }) // p_
+  if (buoc === 'list') {
+    const a = ['name', 'id', 'status', 'effective_status', 'account_id']
+    if (cap !== 'campaign') a.push('campaign_id')
+    if (cap === 'ad') a.push('adset_id', 'creative{thumbnail_url}')
+    return docGetQlqc(`${chaQlqc(cha.level, cha.id)}/${CANH_QLQC[cap]}`, dsCanh(a))
+  }
+  if (buoc === 'info') return docGetQlqc(`${chaQlqc(cha.level, cha.id)}/${CANH_QLQC[cap]}`, dsCanh(['id', ...fields]))
+  if (buoc === 'insights') {
+    return docPostQlqc(`${chaQlqc(cha.level, cha.id)}/insights`, goiQlqcThuong({ method: 'get', fields: [...new Set([...fields, `${cap}_id`, 'account_currency'])], level: cap,
+      ...ngayQlqc(dateRange), limit: 500, filtering: locQlqc([theoIdQlqc(cap, ids)]) }))
+  }
+  if (buoc === 'totals') {
+    const n = goiQlqcThuong({ method: 'get', column_fields: [...new Set([...columns, `${cap}_id`])], ...ngayQlqc(dateRange), level: 'account', limit: 1000,
+      filtering: locQlqc([...filtering, theoIdQlqc(cap, ids)]) })
+    const a = await goiQlqc(`${chaQlqc(cha.level, cha.id)}/am_tabular`, { method: 'POST', body: n })
+    if (!a.ok) return a
+    if (!Array.isArray(a.data.data)) return KHONG_DS_QLQC()
+    const l = tongQlqc(a.data.data)
+    delete l[`${cap}_id`]
+    return { ok: true, data: l }
+  }
+  if (buoc === 'currency') {
+    const n = await goiQlqc(chaQlqc('adaccount', accountId), { method: 'GET', params: { fields: 'currency' } })
+    if (!n.ok) return n
+    const a = n.data.currency
+    return typeof a !== 'string' || a.trim() === '' ? { ok: false, reason: 'invalid-response', message: 'Facebook did not return the account currency' } : { ok: true, data: a.trim().toUpperCase() }
+  }
+  return { ok: false, reason: 'transport', message: `Bước không hợp lệ: ${buoc}` }
+}
+// Ghi (iz 6604:10608-10638): POST /{id} thân form; lỗi Graph ⇒ {message, code, userTitle}; ném ⇒ {message}; còn lại coi là xong (không xét success).
+async function qlqcGhi({ id, body }) {
+  try {
+    const n = await jbGoi(`/${id}`, { method: 'POST', body })
+    if (n?.error) return { ok: false, error: { message: n.message, ...(n.code !== undefined ? { code: n.code } : {}), ...(n.userTitle ? { userTitle: n.userTitle } : {}) } }
+    return { ok: true }
+  } catch (e) {
+    return { ok: false, error: { message: e instanceof Error ? e.message : String(e) } }
+  }
+}
 const CONG_CU = { 'check-hold': checkHold, 'check-location-verification': checkLocation, 'download-invoices': openInvoices,
   'activate-prepay': activatePrepay, 'delete-card': deleteCard, 'set-default-card': setDefaultCard, 'pay-debt': payDebt, 'open-tab': openTab,
   'import-campaign-xlsx': importXlsx, 'boost-gql': boostGql, 'boost-session': boostSession, 'boost-me-pages': boostMePages,
@@ -2101,7 +2258,8 @@ const CONG_CU = { 'check-hold': checkHold, 'check-location-verification': checkL
   'bm-waba-tao': bmBoc(bmWabaTao), 'bm-billing-ds': bmBoc(bmBillingDs), 'bm-billing-sua': bmBoc(bmBillingSua), 'bm-waba-ds': bmBoc(bmWabaDs), 'bm-waba-xoa': bmBoc(bmWabaXoa),
   'bm-page-ds': bmBoc(bmPageDs), 'page-kich-hoat': bmBoc(pageKichHoat),
   'page-me-tkqc': bmBoc(pageMeTkqc), 'page-tao': bmBoc(pageTao), 'page-bai-ds': bmBoc(pageBaiDs), 'page-bai-xoa': bmBoc(pageBaiXoa), 'page-gioi-han-doc': pageGioiHanDoc,
-  'page-gioi-han-ghi': pageGioiHanGhi, 'page-thong-tin': bmBoc(pageThongTin), 'page-hang-muc': bmBoc(pageHangMuc), 'page-tat-cua-toi': bmBoc(pageTatCuaToi), 'phien-fb': phienFb }
+  'page-gioi-han-ghi': pageGioiHanGhi, 'page-thong-tin': bmBoc(pageThongTin), 'page-hang-muc': bmBoc(pageHangMuc), 'page-tat-cua-toi': bmBoc(pageTatCuaToi), 'phien-fb': phienFb,
+  'qlqc-tkqc': qlqcTkqc, 'qlqc-cap': qlqcCap, 'qlqc-ghi': qlqcGhi }
 async function runTool(fn, payload) {
   const f = CONG_CU[fn]
   if (!f) return { ok: false, message: `Tiện ích chưa có chức năng ${fn} — cập nhật VAESA Extension` }
