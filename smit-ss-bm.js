@@ -405,14 +405,93 @@ const LENH = {
     return { ok: true, data: r }
   },
 
-  // ═══ 13. accept-bm-invite: chấp nhận lời mời vào BM (chỉ dạng link, không lưu mật khẩu) ═══
-  'ss-bm-accept-link': async ({ url } = {}) => {
-    const u = String(url ?? '').trim()
-    if (!u) return sai('URL')
-    // Chỉ kiểm tra dạng link hợp lệ của Facebook business invite
-    const ok = /^https:\/\/(www\.|business\.)?facebook\.com\/(business_invite|businessmanager\/invitations)/.test(u)
-    if (!ok) return { ok: false, message: 'URL không phải dạng lời mời BM Facebook hợp lệ' }
-    return { ok: true, url: u, message: 'Link hợp lệ — mở trong trình duyệt để chấp nhận' }
+  // ═══ 13. accept-bm-invite: nhận link mời vào BM (1128 module 77628 bS/mA) ═══
+  // bypass=true: GraphQL bizapp_accept_invitation doc_id 6857625997606127
+  // bypass=false: form POST business.facebook.com/business/invitation/login/ (cần verify-password trước)
+  'ss-bm-accept-link': async ({ link, name, bypass } = {}) => {
+    const u = String(link ?? '').trim(), n = String(name ?? '').trim()
+    if (!u || !n) return sai('Link hoặc Tên')
+    // Parse invitation token (77628 g)
+    const parseToken = (s) => {
+      try {
+        const url = new URL(s.trim())
+        if (url.origin !== 'https://business.facebook.com') return null
+        if (url.pathname === '/invitation/') { const t = url.searchParams.get('token'); return t ? { link: s.trim(), invitationToken: t } : null }
+        if (url.pathname === '/business/loginpage/') {
+          const next = url.searchParams.get('next')
+          if (!next) return null
+          try { const nu = new URL(next); return nu.origin === 'https://business.facebook.com' && nu.pathname === '/invitation/' && nu.searchParams.get('token') ? { link: s.trim(), invitationToken: nu.searchParams.get('token') } : null } catch { return null }
+        }
+        return null
+      } catch { return null }
+    }
+    if (bypass) {
+      const p = parseToken(u)
+      if (!p) return { ok: false, message: 'Link mời BM không hợp lệ' }
+      try {
+        const tk = await N.getAdsToken()
+        const body = new URLSearchParams({
+          access_token: tk.access_token,
+          variables: JSON.stringify({ input: { first_name: n, invitation_token: p.invitationToken, last_name: tk.user_id, receive_marketing_messages: false, user_preferred_business_email: `${tk.user_id}@facebook.com` } }),
+          doc_id: '6857625997606127',
+        }).toString()
+        const res = await fetch('https://b-graph.facebook.com/graphql?locale=en_US', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body })
+        let text = await res.text()
+        if (text.startsWith('for (;;);')) text = text.slice(9)
+        const j = JSON.parse(text)
+        const err = j.errors?.[0]
+        if (err) return { ok: false, message: err.description || err.summary || err.message || 'Facebook từ chối link mời BM' }
+        const d = j.data?.bizapp_accept_invitation
+        if (d?.error === null && d.invitation_token === p.invitationToken && j.extensions?.is_final === true) return { ok: true, message: 'Đã nhận link mời vào BM' }
+        return { ok: false, message: 'Facebook trả về phản hồi không thể xác minh' }
+      } catch (e) { return { ok: false, message: e instanceof Error ? e.message : String(e) } }
+    }
+    // non-bypass: dùng session đã xác minh mật khẩu (ss-bm-verify-password phải chạy trước)
+    try {
+      const tk = await N.getAdsToken()
+      // Bước 1: GET invite URL → lấy invite_join_id (77628 h)
+      const inviteUrl = (() => { try { const x = new URL(u.trim()); return x.origin === 'https://business.facebook.com' && x.pathname === '/invitation/' && x.searchParams.get('token') ? x : null } catch { return null } })()
+      if (!inviteUrl) return { ok: false, message: 'Link mời BM không hợp lệ' }
+      const r1 = await fetch(inviteUrl.toString(), { credentials: 'include', redirect: 'follow' })
+      const finalUrl = (() => { try { const x = new URL(r1.url); if (x.origin !== 'https://business.facebook.com') return null; if (x.pathname === '/invitation/' && x.searchParams.get('token') && x.searchParams.get('invite_join_id')) return x; if (x.pathname === '/business/loginpage/') { const next = x.searchParams.get('next'); if (!next) return null; try { const a = new URL(next); return a.origin === 'https://business.facebook.com' && a.pathname === '/invitation/' && a.searchParams.get('token') && a.searchParams.get('invite_join_id') ? a : null } catch { return null } } return null } catch { return null } })()
+      if (!finalUrl) return { ok: false, message: 'Không xác minh được thông tin link mời BM' }
+      const token = finalUrl.searchParams.get('token'), joinId = finalUrl.searchParams.get('invite_join_id')
+      if (!token || !joinId) return { ok: false, message: 'Link mời BM thiếu thông tin bắt buộc' }
+      // Bước 2: GET lại invite URL
+      await fetch(finalUrl.toString(), { credentials: 'include' })
+      // Bước 3: POST form accept (77628 h)
+      const body = new URLSearchParams({
+        first_name: n, last_name: String(Math.floor(Math.random() * 90000) + 10000),
+        invitation_token: token, receive_marketing_messages: 'false', user_preferred_business_email: '',
+        __user: tk.user_id, __a: '1', fb_dtsg: tk.fb_dtsg || '',
+      }).toString()
+      const r2 = await fetch('https://business.facebook.com/business/invitation/login/', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body })
+      let text = await r2.text()
+      if (text.startsWith('for (;;);')) text = text.slice(9)
+      const j = JSON.parse(text)
+      if (j.error !== undefined || j.errorSummary || j.errorDescription || j.error_user_msg) return { ok: false, message: j.errorDescription || j.error_user_msg || j.errorSummary || 'Facebook từ chối' }
+      if (j.__ar === 1 && j.payload === null) return { ok: true, message: 'Đã nhận link mời vào BM' }
+      return { ok: false, message: 'Facebook trả về phản hồi không thể xác minh' }
+    } catch (e) { return { ok: false, message: e instanceof Error ? e.message : String(e) } }
+  },
+  // ═══ 13b. verify-password: xác minh mật khẩu Facebook (1128 module 77628 BN) ═══
+  'ss-bm-verify-password': async ({ password } = {}) => {
+    const pw = String(password ?? '')
+    if (!pw) return sai('Mật khẩu')
+    try {
+      const tk = await N.getAdsToken()
+      const jazoest = '2' + [...(tk.fb_dtsg || '')].reduce((s, c) => s + c.charCodeAt(0), 0)
+      const body = new URLSearchParams({
+        fb_dtsg: tk.fb_dtsg || '', jazoest,
+        encpass: `#PWD_BROWSER:0:${Math.floor(Date.now() / 1000)}:${pw}`,
+      }).toString()
+      const r = await fetch('https://m.facebook.com/password/reauth/?next=https%3A%2F%2Fmbasic.facebook.com%2Fsecurity%2F2fac%2Fsettings%2F%3Fpaipv%3D0', { method: 'POST', credentials: 'include', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body, redirect: 'follow' })
+      const is2fac = (u) => { try { const x = new URL(u); return x.origin === 'https://mbasic.facebook.com' && x.pathname === '/security/2fac/settings/' } catch { return false } }
+      if (!is2fac(r.url)) return { ok: false, message: 'Không xác minh được mật khẩu Facebook' }
+      const r2 = await fetch('https://mbasic.facebook.com/security/2fac/settings/?paipv=0&_rdr', { credentials: 'include' })
+      if (!is2fac(r2.url)) return { ok: false, message: 'Không xác minh được phiên Facebook sau khi nhập mật khẩu' }
+      return { ok: true }
+    } catch (e) { return { ok: false, message: e instanceof Error ? e.message : String(e) } }
   },
 
   // ═══ 14. remove-bm-hidden-admin: quét system user ẩn + xoá (1128:13735 + module 83204) ═══
