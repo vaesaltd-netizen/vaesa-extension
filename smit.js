@@ -161,7 +161,7 @@ function mapAccount(acc, myUserId) {
     owner,
     owner_business_id: acc.owner_business?.id || '',
     owner_business_name: acc.owner_business?.name || '',
-    agencies: (acc.agencies?.data || []).map((a) => ({ id: a.id, name: a.name })),
+    agencies: (acc.agencies?.data || []).map((a) => ({ id: a.id, name: a.name, ...(a.permitted_tasks ? { permitted_tasks: a.permitted_tasks } : {}) })), // permitted_tasks ⇒ partnerRoles (1927:479-486)
     // Vai trò của CHÍNH người đang đăng nhập trong TKQC (cột Quyền).
     my_role: myUserId ? (acc.users?.data || []).find((u) => u.id === myUserId)?.role ?? null : null,
     role_counts: { admin: dem('admin'), analyst: dem('analyst'), advertiser: dem('advertiser') },
