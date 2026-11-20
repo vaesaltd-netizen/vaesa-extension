@@ -4,7 +4,7 @@
 // của nhân viên vẫn chạy (anh Trung 19/11: bản Smit đang làm dở vẫn tự cập nhật xuống máy NV).
 try { importScripts('smit.js') } catch (e) { console.error('[VAESA] nạp smit.js lỗi:', e?.message || e) }
 // Super Share (mỗi tab một tệp lệnh, tự đăng ký vào self.vaesaSmitThem) — lỗi tệp nào chỉ hỏng nhóm công cụ đó.
-for (const t of ['smit-ss-tkqc.js', 'smit-ss-bm.js', 'smit-ss-page.js']) { try { importScripts(t) } catch (e) { console.error(`[VAESA] nạp ${t} lỗi:`, e?.message || e) } }
+for (const t of ['smit-ss-tkqc.js', 'smit-ss-bm.js', 'smit-ss-page.js', 'smit-ss-pixel.js']) { try { importScripts(t) } catch (e) { console.error(`[VAESA] nạp ${t} lỗi:`, e?.message || e) } }
 //
 // Port verbatim từ Retion 0.2.3.1 (EXT-0.2.3.1).
 // Source: chrome-extension/src/background/background/facebook/{user,client,page}.ts
