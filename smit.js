@@ -2428,10 +2428,12 @@ const CONG_CU = { 'check-hold': checkHold, 'check-location-verification': checkL
   'qlqc-tkqc': qlqcTkqc, 'qlqc-cap': qlqcCap, 'qlqc-ghi': qlqcGhi,
   'as-tkqc': asTkqc, 'as-tkqc-id': asTkqcId, 'as-xuat': asXuat, 'as-hoi': asHoi, 'as-csv': asCsv }
 async function runTool(fn, payload) {
-  const f = CONG_CU[fn]
+  const f = CONG_CU[fn] || self.vaesaSmitThem?.[fn] // lệnh Super Share ở smit-ss-*.js đăng ký vào self.vaesaSmitThem
   if (!f) return { ok: false, message: `Tiện ích chưa có chức năng ${fn} — cập nhật VAESA Extension` }
   try { return await f(payload || {}) } catch (e) { return { ok: false, message: String(e?.message || e) } }
 }
 
+// Hàm dùng chung cho các tệp lệnh smit-ss-*.js (Super Share TKQC / BM / Page) — chỉ đọc, không sửa ở tệp kia.
+self.vaesaSmitNoi = { GRAPH, getAdsToken, graphGet, graphPost, graphql, graphJB, jbGoi, docHet, goiGraphql, gqlBm, relayBm, bmBoc, thuLoi, lan3, jazoest, docGraphql, loiPhien, boAct, tachId, ngu, docJson, maPhien, graphLo, docTiepTrang, boostSession, bmNguoiDung, maPageCua }
 self.vaesaSmit = { changeInfo, fetchAdAccounts, fetchNoRoleAccounts, fetchHiddenLimit, fetchSpend, openCloseAccount, spendLimit, renameAccount, runTool }
 })()
