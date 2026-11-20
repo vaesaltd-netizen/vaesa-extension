@@ -207,7 +207,20 @@ async function pageSsGoIg({ pageId, profileId, cmid }) {
   return r.data?.page_unlink_instagram_account_v2?.page ? { ok: true, message: 'đã gỡ liên kết Instagram' } : { ok: false, message: 'Facebook không xác nhận việc gỡ liên kết Instagram' }
 }
 
+// ── Xoá QTV Page (1128 module 78305 _ / b, 16598-16638) ────────────────────────────────────────────────────────────────────────────────
+async function pageSsQtvDs({ pageId }) { // _(): BM sở hữu + người có quyền trên Page
+  const t = await jbGoi(`/${pageId}`, { params: { fields: 'owner_business,userpermissions.limit(500){user{id},status}' } })
+  return t.error ? { ok: false, error: t.message } : { ok: true, data: t }
+}
+async function pageSsQtvXoa({ pageId, bmId, userId }) { // b(): POST /{page}/userpermissions method=delete
+  const { fb_dtsg } = await getAdsToken()
+  if (!fb_dtsg) return { ok: false, message: 'chưa đăng nhập Facebook' }
+  const r = await jbGoi(`/${pageId}/userpermissions`, { method: 'POST', version: 'v24.0', body: { pageId, business: bmId, method: 'delete', user: userId, fb_dtsg } })
+  return r.error ? { ok: false, message: r.message } : r.success === true ? { ok: true, message: 'đã xóa (BM)' } : { ok: false, message: 'Graph không trả success=true' }
+}
+
 const LENH = {
+  'page-ss-qtv-ds': bmBoc(pageSsQtvDs), 'page-ss-qtv-xoa': bmBoc(pageSsQtvXoa),
   'page-ss-reauth': bmBoc(pageSsReauth), 'page-ss-moi-qtv': bmBoc(pageSsMoiQtv), 'page-ss-2fa': bmBoc(pageSs2fa),
   'page-ss-loi-moi-ds': bmBoc(pageSsLoiMoiDs), 'page-ss-loi-moi-tl': bmBoc(pageSsLoiMoiTl),
   'page-ss-vao-bm': bmBoc(pageSsVaoBm), 'page-ss-go-bm': bmBoc(pageSsGoBm),
