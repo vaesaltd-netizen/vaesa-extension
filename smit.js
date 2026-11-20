@@ -2047,7 +2047,12 @@ async function pageDoiTrangThai({ profileId, publish }) {
     variables: JSON.stringify({ profile_id: profileId }) }, { them: relayNguoiDung() })
   if (r.error) return { ok: false, message: r.message }
   const v = publish ? r.data?.xfb_republish_profile : r.data?.xfb_unpublish_profile
-  return v !== (publish ? 'PUBLISHED' : 'DRAFT') ? { ok: false, message: 'Facebook chưa xác nhận đổi trạng thái Page', raw: JSON.stringify(r?.data ?? r ?? null).slice(0, 700) } : { ok: true, message: publish ? 'đã kích hoạt Page' : 'đã huỷ đăng Page' }
+  const target = publish ? 'PUBLISHED' : 'DRAFT'
+  // v === target: FB xác nhận trạng thái mới. v == null: no-op — FB nhận request (hết lỗi phiên) nhưng Page vốn đã ở trạng thái đích nên không
+  // trả trường (đo 20/11: publish Page đang xuất bản ⇒ {"xfb_republish_profile":null}) ⇒ coi là đạt. Lỗi thật đã rơi vào r.error ở trên.
+  if (v === target) return { ok: true, message: publish ? 'đã kích hoạt Page' : 'đã huỷ đăng Page' }
+  if (v == null) return { ok: true, message: publish ? 'Page vốn đang hiển thị' : 'Page vốn đang ẩn' }
+  return { ok: false, message: 'Facebook chưa xác nhận đổi trạng thái Page', raw: JSON.stringify(r?.data ?? r ?? null).slice(0, 700) }
 }
 // Gỡ giới hạn quốc gia của Page (36763 S): GraphQL www CountryRestrictionSettingMutation av=Page — phần duy nhất của "Đặt giới hạn trang" cần danh tính Page.
 async function pageGoQuocGia({ profileId }) {
