@@ -373,6 +373,24 @@ const LENH = {
     return { ok: true, data: r }
   },
 
+  // ss-bm-bag-members: liệt kê thành viên nhóm tài sản (94034 f() + 83135.Y: contained_adaccounts / contained_pages).
+  'ss-bm-bag-members': async ({ bagId, edge } = {}) => {
+    const bag = String(bagId ?? '').trim()
+    if (!bag) return sai('ID nhóm')
+    const e = edge === 'contained_pages' ? 'contained_pages' : 'contained_adaccounts'
+    const rows = [], seen = new Set()
+    let next
+    do {
+      const r = next
+        ? await N.jbGoi(next, { tokenPurpose: 'businessManagerAction' })
+        : await N.jbGoi(`/${bag}/${e}`, { version: 'v24.0', params: { fields: 'id,name', limit: 500 }, tokenPurpose: 'businessManagerAction' })
+      if (loiGraph(r)) return next ? { ok: true, rows, complete: false } : { ok: false, message: r.message || r.error?.message || 'Lỗi' }
+      for (const item of r?.data || []) { const id = String(item.id ?? '').trim(); if (id && !seen.has(id)) { seen.add(id); rows.push({ id, name: item.name ?? '' }) } }
+      next = r?.paging?.next
+    } while (next)
+    return { ok: true, rows, complete: true }
+  },
+
   // ═══ 12. cancel-pending-invites: huỷ lời mời chờ (1128:11513-11596) ══════════════════
   'ss-bm-pending-users': async ({ bm } = {}) => {
     const b = so(bm)
